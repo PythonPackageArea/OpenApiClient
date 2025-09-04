@@ -616,8 +616,10 @@ class ClientGenerator:
         # FastAPI структура
         if "__services__" in schema_name:
             parts = schema_name.split("__")
-            if len(parts) >= 3:
-                return parts[2]  # accounts, sessions, etc
+            if len(parts) >= 4 and parts[2] == "services":
+                return parts[3]  # users, bots, broadcasts, etc
+            elif len(parts) >= 3:
+                return parts[2]  # accounts, sessions, etc для старых форматов
 
         # Особые схемы по именам
         specific_mappings = {
