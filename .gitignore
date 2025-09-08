@@ -137,4 +137,4 @@ Thumbs.db
 test_output/
 api_test/
 expanded-file.json
-tests
+tests/
