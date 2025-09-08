@@ -27,7 +27,15 @@ class Variable(BaseModel):
         _value = self.value
 
         if isinstance(self.value, list):
-            _value = ", ".join([_.__str__() for _ in self.value])
+            # Для списка элементов, преобразуем каждый в строку
+            str_values = []
+            for item in self.value:
+                if isinstance(item, Variable):
+                    str_values.append(str(item))
+                else:
+                    # Для строк просто используем как есть (сохраняем кавычки)
+                    str_values.append(str(item))
+            _value = ", ".join(str_values)
 
         if self.wrap_name is None:
             return _value
@@ -71,9 +79,19 @@ class Parameter(BaseModel):
         self.var_type = var_type
 
     def __str__(self):
+        # Для параметров с типом Variable, убеждаемся что кавычки сохраняются
+        type_str = ""
+        if self.var_type:
+            # Если var_type это Variable и value это строка в кавычках, сохраняем их
+            if isinstance(self.var_type, Variable):
+                # Variable.__str__() должен правильно обработать кавычки
+                type_str = str(self.var_type)
+            else:
+                type_str = str(self.var_type)
+
         return (
             self.name
-            + (f": {self.var_type}" if self.var_type else "")
+            + (f": {type_str}" if type_str else "")
             + (f" = {self.default}" if self.default else "")
         )
         # return (" " if self.type else "").join(filter(bool, [
@@ -168,6 +186,9 @@ class Function(BaseModel):
         return (
             (
                 decorators_str
+                + (
+                    "\n" if decorators_str else ""
+                )  # Добавляем перенос строки после декораторов
                 + "\n".join(
                     [
                         f"{'async ' if self.async_def else ''}def {self.name}("

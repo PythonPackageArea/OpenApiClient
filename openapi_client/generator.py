@@ -11,8 +11,13 @@ from .internal.types.models import Project
 class ApiClientGenerator:
     """Чистый интерфейс для генерации API клиентов"""
 
-    def __init__(self, openapi_spec: Dict[str, Any], source_url: str = None):
-        self.parser = OpenApiParser(openapi_spec, source_url)
+    def __init__(
+        self,
+        openapi_spec: Dict[str, Any],
+        source_url: str = None,
+        original_spec: Dict[str, Any] = None,
+    ):
+        self.parser = OpenApiParser(openapi_spec, source_url, original_spec)
 
     def generate(self) -> Project:
         """Генерация проекта клиента"""

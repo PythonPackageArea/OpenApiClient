@@ -11,7 +11,12 @@ class SchemaNameResolver:
         """Регистрация схемы с чистым именем"""
         self._schema_registry[original_name] = {"clean_name": clean_name, "zone": zone}
 
-    def resolve_schema_name(self, original_name: str, current_zone: str = "") -> str:
+    def resolve_schema_name(
+        self,
+        original_name: str,
+        current_zone: str = "",
+        include_zone_prefix: bool = True,
+    ) -> str:
         """Получение чистого имени схемы с учетом зоны"""
         if original_name in self._schema_registry:
             info = self._schema_registry[original_name]
@@ -19,7 +24,12 @@ class SchemaNameResolver:
             clean_name = info["clean_name"]
 
             # Если схема из другой зоны, добавляем префикс зоны для кросс-ссылок
-            if current_zone and schema_zone != current_zone and schema_zone != "common":
+            if (
+                include_zone_prefix
+                and current_zone
+                and schema_zone != current_zone
+                and schema_zone != "common"
+            ):
                 return f"{schema_zone}.{clean_name}"
 
             # Специальная логика для общих схем в common зоне
@@ -56,7 +66,8 @@ class SchemaNameResolver:
                 clean_name = info["clean_name"]
                 # Если это другая зона, возвращаем с префиксом
                 if (
-                    current_zone
+                    include_zone_prefix
+                    and current_zone
                     and schema_zone != current_zone
                     and schema_zone != "common"
                 ):
@@ -83,8 +94,13 @@ class SchemaNameResolver:
     def _clean_schema_name(name: str) -> str:
         """Универсальная очистка имени схемы с правильным PascalCase"""
         # Универсальная обработка ____Schemas____ структур
-        if "____Schemas____" in name:
-            parts = name.split("____Schemas____")
+        if "____Schemas____" in name or "____Schemas__" in name:
+            # Разбиваем по разным вариантам паттерна
+            if "____Schemas____" in name:
+                parts = name.split("____Schemas____")
+            else:
+                parts = name.split("____Schemas__")
+
             if len(parts) == 2:
                 prefix_parts = [p for p in parts[0].split("__") if p]
                 suffix = parts[1].strip("__")
@@ -93,7 +109,7 @@ class SchemaNameResolver:
                 if len(prefix_parts) >= 2:
                     zone = prefix_parts[-2].capitalize()
 
-                    # Создаем итоговое имя: Users + Read = UsersRead
+                    # Создаем итоговое имя: Bots + Create = BotsCreate
                     if suffix:
                         return f"{zone}{suffix}"
 
@@ -105,7 +121,17 @@ class SchemaNameResolver:
         if "__" in name and len(name.split("__")) >= 3:
             parts = [p for p in name.split("__") if p]  # убираем пустые части
 
-            # Берем последние 2 значимые части (зона + тип операции)
+            # Ищем часть schemas и берем соседние части
+            for i, part in enumerate(parts):
+                if part.lower() == "schemas":
+                    # Ищем зону и операцию после schemas
+                    if i < len(parts) - 2:
+                        zone = parts[i + 1].capitalize()
+                        operation = parts[i + 2].capitalize()
+                        # Возвращаем ZoneOperation (например BotsCreate)
+                        return f"{zone}{operation}"
+
+            # Fallback - берем последние 2 значимые части (зона + тип операции)
             if len(parts) >= 2:
                 # Исключаем очевидно служебные части (короткие или повторяющиеся)
                 meaningful_parts = []

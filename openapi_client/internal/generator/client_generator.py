@@ -1,5 +1,6 @@
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set, Tuple
+from collections import defaultdict
 
 from ..types.models import (
     Project,
@@ -12,23 +13,49 @@ from ..types.models import (
 )
 from ..types.schema_resolver import SchemaNameResolver
 from .templates import templates
-from .http_client import aiohttp_common
+
+# from .http_client import aiohttp_common - moved to templates
 
 
 class ClientGenerator:
     """Генератор API клиента из OpenAPI"""
 
-    def __init__(self, openapi_dict: Dict[str, Any], source_url: str = None):
+    def __init__(
+        self,
+        openapi_dict: Dict[str, Any],
+        source_url: str = None,
+        original_spec: Dict[str, Any] = None,
+    ):
         self.openapi_dict = openapi_dict
+        self.original_spec = (
+            original_spec or openapi_dict
+        )  # Используем оригинальную спецификацию если передана
         self.source_url = source_url
         self.project = Project(name="api")
         self.schema_resolver = SchemaNameResolver()
-        self.zones = {}  # zone_name -> {endpoints_file, models_file}
+        self.zones = {}  # zone_name -> {endpoints_file, endpoints_class}
         self.used_schemas = set()  # Только используемые схемы
+        self.schema_file_names = {}  # schema_name -> file_name mapping
+
+    def _analyze_schema_names(self) -> Dict[str, str]:
+        """Анализ имен схем для генерации оптимальных имен файлов"""
+        schemas = self.openapi_dict.get("components", {}).get("schemas", {})
+        schema_to_filename = {}
+
+        for schema_name in schemas.keys():
+            # Получаем чистое имя схемы
+            clean_name = self._get_clean_schema_name(schema_name)
+
+            # Генерируем имя файла из полного имени модели
+            filename = self._snake_case(clean_name)
+            schema_to_filename[schema_name] = filename
+
+        return schema_to_filename
 
     def generate(self) -> Project:
         """Основная генерация"""
         self._create_base_files()
+        self.schema_file_names = self._analyze_schema_names()  # Анализируем имена схем
         self._register_all_schemas()  # ОТКАТ: регистрируем ВСЕ схемы
         self._generate_schemas()
         self._generate_endpoints()
@@ -138,7 +165,7 @@ class ClientGenerator:
         """Создание базовых файлов проекта"""
         # Основные файлы
         self.project.add_file("common.py").add_code_block(
-            CodeBlock(code=aiohttp_common)
+            CodeBlock(code=templates.aiohttp_common)
         )
         self.project.add_file("client.py").add_code_block(
             CodeBlock(code=templates.client)
@@ -150,7 +177,10 @@ class ClientGenerator:
             CodeBlock(code=templates.lib_exc)
         )
         self.project.add_file("lib/utils.py").add_code_block(
-            CodeBlock(code=self._generate_utils_content())
+            CodeBlock(code=templates.lib_utils)
+        )
+        self.project.add_file("lib/decorators.py").add_code_block(
+            CodeBlock(code=templates.lib_decorators)
         )
         self.project.add_file("lib/__init__.py").add_code_block(CodeBlock(code=""))
         # self.project.add_file("py.typed").add_code_block(CodeBlock(code="# PEP 561"))
@@ -175,37 +205,58 @@ class ClientGenerator:
             )
 
     def _generate_schemas(self):
-        """Генерация всех Pydantic моделей из components/schemas и inline схем"""
+        """Генерация всех Pydantic моделей из components/schemas в отдельные файлы"""
         schemas = self.openapi_dict.get("components", {}).get("schemas", {})
 
-        # Генерируем схемы из components
-        for schema_name, schema_spec in schemas.items():
-            zone = self._determine_zone(schema_name)
-            clean_name = self._get_clean_schema_name(schema_name)
-            self._ensure_zone(zone)
-            self._generate_model(clean_name, schema_spec, zone)
+        # Создаем папку models и __init__.py
+        models_init = self.project.add_file("models/__init__.py")
+        models_init.imports.extend(
+            [
+                "# Auto-generated models",
+                "from typing import TYPE_CHECKING",
+                "",
+                "# Import all models for easy access",
+            ]
+        )
 
-        # Генерируем inline схемы с title из responses
-        for path, path_spec in self.openapi_dict.get("paths", {}).items():
-            for method, method_spec in path_spec.items():
-                for status_code, response_spec in method_spec.get(
-                    "responses", {}
-                ).items():
-                    if status_code.startswith("2"):  # Только успешные ответы
-                        content = response_spec.get("content", {})
-                        for content_type, content_spec in content.items():
-                            schema = content_spec.get("schema", {})
-                            if (
-                                schema.get("title")
-                                and not "$ref" in schema
-                                and schema.get("type") == "object"
-                            ):
-                                # Это inline схема с title - создаем модель
-                                title = schema["title"]
-                                zone = self._determine_zone(title)
-                                clean_name = self._get_clean_schema_name(title)
-                                self._ensure_zone(zone)
-                                self._generate_model(clean_name, schema, zone)
+        all_models = []
+        models_needing_rebuild = []
+
+        # Генерируем отдельный файл для каждой схемы
+        for schema_name, schema_spec in schemas.items():
+            clean_name = self._get_clean_schema_name(schema_name)
+            filename = self.schema_file_names.get(
+                schema_name, self._snake_case(clean_name)
+            )
+
+            # Генерируем модель в отдельном файле
+            needs_rebuild = self._generate_model(
+                schema_name, clean_name, schema_spec, filename
+            )
+            if needs_rebuild:
+                models_needing_rebuild.append(clean_name)
+
+            all_models.append((filename, clean_name))
+
+        # Добавляем импорты всех моделей в __init__.py
+        # Используем set для удаления дубликатов импортов
+        unique_imports = set()
+        for filename, model_name in all_models:
+            unique_imports.add(f"from .{filename} import {model_name}")
+
+        models_init.imports.extend(sorted(unique_imports))
+
+        # Экспортируем все модели через __all__
+        # Собираем уникальные имена моделей
+        unique_model_names = sorted(set(model_name for _, model_name in all_models))
+        models_init.add_code_block(CodeBlock(code=f"\n__all__ = {unique_model_names}"))
+
+        # Добавляем model_rebuild() для моделей с TYPE_CHECKING импортами
+        if models_needing_rebuild:
+            rebuild_code = "\n# Rebuild models with forward references to resolve TYPE_CHECKING imports"
+            for model_name in models_needing_rebuild:
+                rebuild_code += f"\n{model_name}.model_rebuild()"
+            models_init.add_code_block(CodeBlock(code=rebuild_code, order=100))
 
     def _generate_endpoints(self):
         """Генерация endpoints по тегам"""
@@ -216,7 +267,7 @@ class ClientGenerator:
                 self._generate_endpoint_method(path, method, method_spec, zone)
 
     def _generate_endpoint_method(self, path: str, method: str, spec: Dict, zone: str):
-        """Генерация метода endpoint с чистым кодом через locals()"""
+        """Генерация метода endpoint с декораторами"""
         zone_class = self.zones[zone.lower()]["endpoints_class"]
 
         # Генерируем имя функции
@@ -243,86 +294,27 @@ class ClientGenerator:
         # Тип возврата
         return_type = self._get_return_type(spec.get("responses", {}), zone)
 
-        # Создаем функцию с чистым кодом
+        # Получаем чистое имя модели для декоратора
+        clean_model_type = self._get_clean_model_type(spec.get("responses", {}), zone)
+
+        # Создаем декоратор
+        if clean_model_type != "Any":
+            decorator = f"@{method}('{path}', response_model={clean_model_type})"
+        else:
+            decorator = f"@{method}('{path}')"
+
+        # Создаем функцию с декоратором
         func = zone_class.add_function(
             func_name,
             parameters=parameters,
             async_def=True,
             response=return_type,
             description=spec.get("description", ""),
+            decorators=[decorator],
         )
 
-        # Генерируем чистый код через locals()
-        code = self._generate_clean_endpoint_code(path, method, spec, zone)
-        func.code = CodeBlock(code=code)
-
-    def _generate_clean_endpoint_code(
-        self, path: str, method: str, spec: Dict, zone: str
-    ) -> str:
-        """Генерация чистого кода endpoint через locals()"""
-        code_lines = []
-
-        # Путь с подстановкой параметров
-        if "{" in path:
-            # Находим все {param} в пути и заменяем на правильные имена параметров
-            import re
-
-            path_template = path
-            path_params = re.findall(r"\{(\w+)\}", path)
-
-            # Сопоставляем параметры пути с реальными именами параметров функции
-            path_param_specs = []
-            query_param_specs = []
-
-            for param_spec in spec.get("parameters", []):
-                if param_spec["in"] == "path":
-                    path_param_specs.append(param_spec)
-                elif param_spec["in"] == "query":
-                    query_param_specs.append(param_spec)
-
-            for param in path_params:
-                param_name = None
-
-                # Сначала ищем точное совпадение среди path параметров
-                for param_spec in path_param_specs:
-                    if param_spec["name"] == param:
-                        param_name = f"{param}_path"
-                        break
-
-                # Если не нашли среди path, но есть только один query параметр,
-                # и это единственный path параметр - используем его
-                if (
-                    param_name is None
-                    and len(path_params) == 1
-                    and len(query_param_specs) == 1
-                ):
-                    param_name = f"{query_param_specs[0]['name']}_path"
-
-                # Fallback
-                if param_name is None:
-                    param_name = f"{param}_path"
-
-                path_template = path_template.replace(
-                    f"{{{param}}}", f"{{{param_name}}}"
-                )
-
-            code_lines.append(f"path = f'{path_template}'.rstrip()")
-        else:
-            code_lines.append(f"path = '{path}'.rstrip()")
-
-        # HTTP запрос с использованием utils
-        # Передаем модель для парсинга если она есть
-        clean_model_type = self._get_clean_model_type(spec.get("responses", {}), zone)
-        if clean_model_type != "Any":
-            code_lines.append(
-                f"return await handle_request(self.client, '{method}', path, locals(), response_model={clean_model_type})"
-            )
-        else:
-            code_lines.append(
-                f"return await handle_request(self.client, '{method}', path, locals())"
-            )
-
-        return "\n".join(code_lines)
+        # Декораторы делают всю работу - пустое тело
+        func.code = CodeBlock(code="pass")
 
     def _generate_response_handling(self, responses: Dict, zone: str) -> List[str]:
         """Генерация обработки ответов с новой логикой"""
@@ -598,11 +590,7 @@ class ClientGenerator:
                                     ref_name = variant["$ref"].replace(
                                         "#/components/schemas/", ""
                                     )
-                                    clean_name = (
-                                        self.schema_resolver.resolve_schema_name(
-                                            ref_name, zone
-                                        )
-                                    )
+                                    clean_name = self._get_clean_schema_name(ref_name)
                                     type_variants.append(clean_name)
                                 elif variant.get("type") == "null":
                                     has_null = True
@@ -612,23 +600,22 @@ class ClientGenerator:
                                 ):
                                     # Это развернутая схема с title - ищем зарегистрированную схему
                                     title = variant["title"]
-                                    possible_name = f"{zone.capitalize()}{title}"
-                                    # Проверяем есть ли зарегистрированная схема
+                                    # Ищем схему с таким title
                                     found = False
-                                    for (
-                                        registered_name,
-                                        info,
-                                    ) in self.schema_resolver._schema_registry.items():
-                                        if info["clean_name"] == possible_name:
-                                            type_variants.append(possible_name)
+                                    for schema_name, schema_spec in (
+                                        self.openapi_dict.get("components", {})
+                                        .get("schemas", {})
+                                        .items()
+                                    ):
+                                        if schema_spec.get("title") == title:
+                                            schema_clean_name = (
+                                                self._get_clean_schema_name(schema_name)
+                                            )
+                                            type_variants.append(schema_clean_name)
                                             found = True
                                             break
                                     if not found:
-                                        clean_name = (
-                                            self.schema_resolver.resolve_schema_name(
-                                                title, zone
-                                            )
-                                        )
+                                        clean_name = self._get_clean_schema_name(title)
                                         type_variants.append(clean_name)
                                 else:
                                     var_type = self._get_type(variant, zone)
@@ -654,9 +641,7 @@ class ClientGenerator:
                             ref_name = schema["$ref"].replace(
                                 "#/components/schemas/", ""
                             )
-                            clean_name = self.schema_resolver.resolve_schema_name(
-                                ref_name, zone
-                            )
+                            clean_name = self._get_clean_schema_name(ref_name)
                             success_responses.append(clean_name)
                         elif schema.get("type") == "array" and "items" in schema:
                             # Массив моделей
@@ -665,9 +650,7 @@ class ClientGenerator:
                                 ref_name = items["$ref"].replace(
                                     "#/components/schemas/", ""
                                 )
-                                clean_name = self.schema_resolver.resolve_schema_name(
-                                    ref_name, zone
-                                )
+                                clean_name = self._get_clean_schema_name(ref_name)
                                 success_responses.append(f"List[{clean_name}]")
                             else:
                                 var_type = self._get_type(schema, zone)
@@ -681,10 +664,36 @@ class ClientGenerator:
                             else:
                                 # Инлайн объект с title - используем зарегистрированную схему
                                 title = schema["title"]
-                                clean_name = self.schema_resolver.resolve_schema_name(
-                                    title, zone
-                                )
-                                success_responses.append(clean_name)
+                                # Инлайн объект с title
+                                title = schema["title"]
+                                # Ищем схему с таким title в текущей зоне
+                                for schema_name, schema_spec in (
+                                    self.openapi_dict.get("components", {})
+                                    .get("schemas", {})
+                                    .items()
+                                ):
+                                    if schema_spec.get("title") == title:
+                                        schema_clean_name = self._get_clean_schema_name(
+                                            schema_name
+                                        )
+                                        # Для Paginated схем проверяем зону
+                                        if title == "Paginated" and zone:
+                                            zone_prefix = zone.capitalize()
+                                            if (
+                                                schema_clean_name
+                                                == f"{zone_prefix}Paginated"
+                                            ):
+                                                success_responses.append(
+                                                    schema_clean_name
+                                                )
+                                                break
+                                        elif schema_clean_name:
+                                            success_responses.append(schema_clean_name)
+                                            break
+                                else:
+                                    # Fallback - используем title как есть
+                                    clean_name = self._get_clean_schema_name(title)
+                                    success_responses.append(clean_name)
                         else:
                             var_type = self._get_type(schema, zone)
                             success_responses.append(str(var_type))
@@ -853,35 +862,15 @@ class ClientGenerator:
             endpoints_file.imports.extend(
                 [
                     "from ..lib import models",
-                    "from ..lib.utils import prepare_params, prepare_body_data, prepare_files, handle_request",
+                    "from ..lib.decorators import get, post, put, delete, patch",
                     "from ..common import AiohttpClient",
                     "from typing import Union, Optional, List, Literal, Any",
                     "from datetime import datetime",
                 ]
             )
 
-            # Добавляем импорт моделей для данной зоны (lowercase)
-            models_import = f"from ..models.{zone.lower()} import *"
-            endpoints_file.imports.append(models_import)
-
-            # Добавляем импорт общих схем только если есть модели в common
-            if any(
-                info["zone"] == "common"
-                for info in self.schema_resolver._schema_registry.values()
-            ):
-                endpoints_file.imports.append("from ..models.common import *")
-
-            # Добавляем импорты других зон для body параметров
-            other_zones = set()
-            for schema_name, info in self.schema_resolver._schema_registry.items():
-                schema_zone = info["zone"]
-                if schema_zone != zone and schema_zone != "common":
-                    other_zones.add(schema_zone)
-
-            for other_zone in sorted(other_zones):
-                endpoints_file.imports.append(
-                    f"from ..models.{other_zone.lower()} import *"
-                )
+            # Добавляем импорт всех моделей из единого модуля
+            endpoints_file.imports.append("from ..models import *")
 
             # Кросс-импорты уже добавлены выше
 
@@ -896,35 +885,47 @@ class ClientGenerator:
                 code=CodeBlock(code="self.client = client"),
             )
 
-            # Хелпер методы теперь в lib/utils.py
-
-            # models/<zone>.py (всегда lowercase для консистентности)
-            models_file = self.project.add_file(f"models/{zone.lower()}.py")
-            models_file.imports.extend(
-                [
-                    "from pydantic import BaseModel",
-                    "from enum import Enum",
-                    "from typing import Optional, Union, List, Dict, Literal, Any, TYPE_CHECKING",
-                    "from datetime import datetime",
-                ]
-            )
-
-            # Добавляем кросс-импорты для других зон
-            self._add_model_cross_imports(models_file, zone)
-
             self.zones[zone_key] = {
                 "endpoints_file": endpoints_file,
                 "endpoints_class": zone_class,
-                "models_file": models_file,
             }
 
-    def _generate_model(self, name: str, schema_spec: Dict, zone: str):
-        """Генерация Pydantic модели"""
-        models_file = self.zones[zone.lower()]["models_file"]
+    def _collect_field_dependencies(self, field_spec: Dict, dependencies: Set[str]):
+        """Рекурсивно собирает зависимости из спецификации поля"""
+        if "$ref" in field_spec:
+            ref_name = field_spec["$ref"].replace("#/components/schemas/", "")
+            dependencies.add(ref_name)
+        elif field_spec.get("anyOf") or field_spec.get("oneOf"):
+            variants = field_spec.get("anyOf", []) + field_spec.get("oneOf", [])
+            for variant in variants:
+                self._collect_field_dependencies(variant, dependencies)
+        elif field_spec.get("type") == "array" and "items" in field_spec:
+            self._collect_field_dependencies(field_spec["items"], dependencies)
+        elif field_spec.get("type") == "object" and "title" in field_spec:
+            # Inline объект - пытаемся найти соответствующую схему
+            title = field_spec["title"]
+            for reg_name, info in self.schema_resolver._schema_registry.items():
+                schemas_dict = self.original_spec.get("components", {}).get(
+                    "schemas", {}
+                )
+                if reg_name in schemas_dict:
+                    reg_schema = schemas_dict[reg_name]
+                    if reg_schema.get("title") == title:
+                        dependencies.add(reg_name)
+                        break
 
+    def _add_model_to_file(
+        self,
+        model_file: CodeFile,
+        original_name: str,
+        clean_name: str,
+        schema_spec: Dict,
+        dependencies: Set[str],
+    ):
+        """Добавление модели к файлу"""
         if schema_spec.get("enum"):
             # Enum модель
-            model_class = models_file.add_class(name, inherits=["str", "Enum"])
+            model_class = model_file.add_class(clean_name, inherits=["str", "Enum"])
             for enum_value in schema_spec["enum"]:
                 model_class.parameters.append(
                     Parameter(
@@ -942,13 +943,27 @@ class ClientGenerator:
             return
         else:
             # Обычная модель
-            model_class = models_file.add_class(name, inherits=["BaseModel"])
+            model_class = model_file.add_class(clean_name, inherits=["BaseModel"])
 
             properties = schema_spec.get("properties", {})
             required = schema_spec.get("required", [])
 
+            # Пытаемся получить оригинальные свойства из original_spec
+            original_properties = {}
+            if original_name in self.original_spec.get("components", {}).get(
+                "schemas", {}
+            ):
+                original_properties = self.original_spec["components"]["schemas"][
+                    original_name
+                ].get("properties", {})
+
             for field_name, field_spec in properties.items():
-                field_type = self._get_type_for_model_field(field_spec, zone)
+                # Если есть оригинальная спецификация поля, используем ее для определения типа
+                original_field_spec = original_properties.get(field_name, field_spec)
+
+                field_type = self._get_type_for_model_field(
+                    original_field_spec, "", dependencies
+                )
 
                 # Делаем Optional если не required
                 if field_name not in required:
@@ -962,30 +977,124 @@ class ClientGenerator:
                     Parameter(name=field_name, var_type=field_type, default=default)
                 )
 
+    def _generate_model(
+        self, original_name: str, clean_name: str, schema_spec: Dict, filename: str
+    ) -> bool:
+        """Генерация Pydantic модели в отдельный файл"""
+        # Создаем отдельный файл для каждой модели
+        model_file = self.project.add_file(f"models/{filename}.py")
+
+        # Базовые импорты
+        model_file.imports.extend(
+            [
+                "from __future__ import annotations",
+                "",
+                "from pydantic import BaseModel",
+                "from enum import Enum",
+                "from typing import Optional, Union, List, Dict, Literal, Any, TYPE_CHECKING",
+                "from datetime import datetime",
+            ]
+        )
+
+        if schema_spec.get("enum"):
+            # Enum модель
+            model_class = model_file.add_class(clean_name, inherits=["str", "Enum"])
+            for enum_value in schema_spec["enum"]:
+                model_class.parameters.append(
+                    Parameter(
+                        name=str(enum_value).upper(),
+                        default=Variable(value=repr(enum_value)),
+                    )
+                )
+        elif (
+            schema_spec.get("type") == "object"
+            and "additionalProperties" in schema_spec
+            and not schema_spec.get("properties")
+        ):
+            # Схема с additionalProperties без properties - это должен быть Dict, а не модель
+            # Пропускаем создание модели, она будет обрабатываться как Dict[str, type]
+            return
+        else:
+            # Обычная модель
+            model_class = model_file.add_class(clean_name, inherits=["BaseModel"])
+
+            properties = schema_spec.get("properties", {})
+            required = schema_spec.get("required", [])
+
+            # Собираем зависимости для импортов
+            dependencies = set()
+
+            # Пытаемся получить оригинальные свойства из original_spec
+            original_properties = {}
+            if original_name in self.original_spec.get("components", {}).get(
+                "schemas", {}
+            ):
+                original_properties = self.original_spec["components"]["schemas"][
+                    original_name
+                ].get("properties", {})
+
+            for field_name, field_spec in properties.items():
+                # Если есть оригинальная спецификация поля, используем ее для определения типа
+                original_field_spec = original_properties.get(field_name, field_spec)
+
+                field_type = self._get_type_for_model_field(
+                    original_field_spec, "", dependencies
+                )
+
+                # Делаем Optional если не required
+                if field_name not in required:
+                    if field_type.wrap_name != "Optional":
+                        field_type = Variable(value=field_type, wrap_name="Optional")
+                    default = Variable(value="None")
+                else:
+                    default = None
+
+                model_class.parameters.append(
+                    Parameter(name=field_name, var_type=field_type, default=default)
+                )
+
+            # Добавляем импорты зависимостей под TYPE_CHECKING
+            type_checking_imports = []
+            for dep in sorted(dependencies):
+                if dep != clean_name:  # Не импортируем сам себя
+                    dep_filename = self.schema_file_names.get(
+                        dep, self._snake_case(dep)
+                    )
+                    dep_clean_name = self._get_clean_schema_name(dep)
+                    type_checking_imports.append(
+                        f"    from .{dep_filename} import {dep_clean_name}"
+                    )
+
+            if type_checking_imports:
+                model_file.imports.append("")
+                model_file.imports.append("if TYPE_CHECKING:")
+                model_file.imports.extend(type_checking_imports)
+
+        # Добавляем метод rebuild в конец файла только для BaseModel (не для Enum)
+        # и только если нет TYPE_CHECKING импортов
+        needs_rebuild_in_init = False
+        if not schema_spec.get("enum"):
+            if not type_checking_imports:
+                # Нет TYPE_CHECKING импортов - добавляем model_rebuild() в файл
+                model_file.add_code_block(
+                    CodeBlock(
+                        code=f"\n# Rebuild model to resolve forward references\n{clean_name}.model_rebuild()",
+                        order=-100,  # Отрицательный order чтобы был в самом конце
+                    )
+                )
+            else:
+                # Есть TYPE_CHECKING импорты - нужен model_rebuild() в __init__.py
+                needs_rebuild_in_init = True
+
+        return needs_rebuild_in_init
+
     def _get_clean_schema_name(self, schema_name: str) -> str:
         """Получение чистого имени схемы"""
         return self.schema_resolver._clean_schema_name(schema_name)
 
-    def _add_model_aliases(self):
-        """Добавление алиасов моделей только в зоны с endpoints"""
-        for zone_name, zone_info in self.zones.items():
-            zone_class = zone_info["endpoints_class"]
-
-            # Проверяем есть ли endpoints в этой зоне (исключаем __init__)
-            has_endpoints = any(
-                func_name != "__init__" for func_name in zone_class.functions.keys()
-            )
-
-            # Добавляем алиасы только если есть endpoints
-            if has_endpoints:
-                self._add_model_attributes_to_zone(zone_class, zone_name)
-
     def _finalize_structure(self):
         """Финализация структуры проекта"""
-        # Добавляем алиасы моделей в endpoint классы
-        self._add_model_aliases()
-
-        # Убираем пустые зоны (только с алиасами, без endpoints)
+        # Убираем пустые зоны (без endpoints)
         self._remove_empty_zones()
 
         # Создаем динамический client.py с прямым доступом к зонам
@@ -1002,59 +1111,26 @@ class ClientGenerator:
                 func_name != "__init__" for func_name in zone_class.functions.keys()
             )
 
-            # Также проверяем есть ли модели в зоне
-            models_file = zone_info["models_file"]
-            has_models = bool(models_file.classes)
-
-            # Удаляем зону если нет ни методов ни моделей, кроме common
-            if not has_methods and not has_models and zone_name != "common":
+            # Удаляем зону если нет методов
+            if not has_methods:
                 empty_zones.append(zone_name)
-            # Или если есть только алиасы без реальных endpoints (как services зона)
-            elif not has_methods and zone_name not in ["common"]:
-                # Проверяем есть ли в зоне только алиасы (параметры класса без функций)
-                if zone_class.parameters and not has_models:
-                    empty_zones.append(zone_name)
 
         # Удаляем пустые зоны
         for zone_name in empty_zones:
             # Удаляем из проекта
             zone_info = self.zones[zone_name]
             endpoints_file = zone_info["endpoints_file"]
-            models_file = zone_info["models_file"]
 
-            # Удаляем файлы из проекта
+            # Удаляем файл из проекта
             if endpoints_file.file_name in [f.file_name for f in self.project.files]:
                 self.project.files = [
                     f
                     for f in self.project.files
                     if f.file_name != endpoints_file.file_name
                 ]
-            if models_file.file_name in [f.file_name for f in self.project.files]:
-                self.project.files = [
-                    f
-                    for f in self.project.files
-                    if f.file_name != models_file.file_name
-                ]
 
             # Удаляем из zones
             del self.zones[zone_name]
-
-        # models/__init__.py
-        models_init = self.project.add_file("models/__init__.py")
-        # Убираем дубликаты импортов (case-insensitive)
-        unique_zones = {}
-        for zone_name in self.zones.keys():
-            zone_lower = zone_name.lower()
-            if zone_lower not in unique_zones:
-                unique_zones[zone_lower] = zone_name
-
-        for zone_name in unique_zones.values():
-            models_init.imports.append(f"from . import {zone_name.lower()}")
-        models_init.add_code_block(
-            CodeBlock(
-                code=f"__all__ = {[zone.lower() for zone in unique_zones.values()]}"
-            )
-        )
 
         # Главный __init__.py
         main_init = self.project.add_file("__init__.py")
@@ -1119,7 +1195,19 @@ class ClientGenerator:
 
     @staticmethod
     def _snake_case(name: str) -> str:
-        return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+        # Сначала заменяем дефисы на подчеркивания
+        name = name.replace("-", "_")
+
+        # Обработка аббревиатур: HTTPValidationError -> http_validation_error
+        # Шаг 1: Добавляем подчеркивание перед заглавной буквой, которая следует за строчной
+        s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+        # Шаг 2: Добавляем подчеркивание между строчной буквой и заглавной
+        s2 = re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1)
+        # Шаг 3: Обрабатываем последовательности заглавных букв (HTTP -> HTTP, HTTPError -> HTTP_Error)
+        s3 = re.sub("([A-Z]+)([A-Z][a-z])", r"\1_\2", s2)
+        # Шаг 4: Убираем дублирующиеся подчеркивания
+        s4 = re.sub("_+", "_", s3)
+        return s4.lower()
 
     @staticmethod
     def _pascal_case(name: str) -> str:
@@ -1145,23 +1233,6 @@ class ClientGenerator:
                 parts.append(part.capitalize())
 
         return "".join(parts)
-
-    def _add_model_attributes_to_zone(self, zone_class: Class, zone: str):
-        """Добавление моделей как атрибутов класса зоны"""
-        # Находим модели которые реально существуют в файле зоны
-        zone_file = self.zones[zone.lower()]["models_file"]
-        existing_models = zone_file.classes.keys()
-
-        # Добавляем как параметры класса (атрибуты) только существующие модели
-        for model_name in existing_models:
-            attr_name = self._snake_case(model_name)
-            zone_class.parameters.append(
-                Parameter(
-                    name=attr_name,
-                    var_type=Variable(value=model_name),
-                    default=Variable(value=model_name),
-                )
-            )
 
     def _get_type(self, schema: Dict, zone: str = "") -> Variable:
         """Получение типа из OpenAPI схемы с правильными $ref"""
@@ -1190,11 +1261,8 @@ class ClientGenerator:
                 ref_name,
                 zone,
             )
-            # Для использования в моделях оборачиваем в кавычки если это кросс-зонная ссылка
-            if "." in resolved_name:
-                return Variable(value=f'"{resolved_name}"')
-            else:
-                return Variable(value=resolved_name)
+            # С from __future__ import annotations кавычки не нужны
+            return Variable(value=f'"{resolved_name}"')
 
         schema_type = schema.get("type", "string")
         format_type = schema.get("format")
@@ -1253,7 +1321,7 @@ class ClientGenerator:
                             ref_name,
                             zone,
                         )
-                        types.append(Variable(value=resolved_name))
+                        types.append(Variable(value=f'"{resolved_name}"'))
                     else:
                         # Fallback для незарегистрированных схем
                         types.append(Variable(value="dict"))
@@ -1264,7 +1332,7 @@ class ClientGenerator:
                         title,
                         zone,
                     )
-                    types.append(Variable(value=resolved_name))
+                    types.append(Variable(value=f'"{resolved_name}"'))
                 else:
                     types.append(self._get_type(variant, zone))
 
@@ -1281,10 +1349,38 @@ class ClientGenerator:
         # Базовый тип
         return Variable(value=type_mapping.get(schema_type, "str"))
 
-    def _get_type_for_model_field(self, schema: Dict, zone: str) -> Variable:
+    def _get_type_for_model_field(
+        self, schema: Dict, zone: str, dependencies: Set[str] = None
+    ) -> Variable:
         """Получение типа для поля модели с правильными $ref"""
         if not schema:
             return Variable(value="Any")
+
+        # Обработка enum с title (развернутая схема после jsonref)
+        if schema.get("enum") and schema.get("title"):
+            title = schema["title"]
+
+            # Ищем зарегистрированную схему с таким title
+            found_schema = None
+            for reg_name, info in self.schema_resolver._schema_registry.items():
+                if self._get_clean_schema_name(reg_name) == title:
+                    found_schema = reg_name
+                    break
+
+            if found_schema:
+                if dependencies is not None:
+                    dependencies.add(found_schema)
+                resolved_name = self.schema_resolver.resolve_schema_name(
+                    found_schema, zone, include_zone_prefix=False
+                )
+                # С from __future__ import annotations кавычки не нужны
+                return Variable(value=f'"{resolved_name}"')
+            else:
+                # Fallback - используем title как есть
+                if dependencies is not None:
+                    dependencies.add(title)
+                # С from __future__ import annotations кавычки не нужны
+                return Variable(value=title)
 
         # anyOf/oneOf в поле модели
         if schema.get("anyOf") or schema.get("oneOf"):
@@ -1299,9 +1395,10 @@ class ClientGenerator:
                     ref_name = variant["$ref"].replace("#/components/schemas/", "")
                     # Проверяем что схема зарегистрирована
                     if ref_name in self.schema_resolver._schema_registry:
-                        schema_zone = self.schema_resolver.get_schema_zone(ref_name)
+                        if dependencies is not None:
+                            dependencies.add(ref_name)
                         resolved_name = self.schema_resolver.resolve_schema_name(
-                            ref_name, zone
+                            ref_name, zone, include_zone_prefix=False
                         )
 
                         # Используем модель с правильным именем
@@ -1312,17 +1409,20 @@ class ClientGenerator:
                 elif variant.get("type") == "object" and "title" in variant:
                     # Inline объект с title - ищем зарегистрированную схему
                     title = variant["title"]
+                    if dependencies is not None:
+                        dependencies.add(title)
                     resolved_name = self.schema_resolver.resolve_schema_name(
-                        title,
-                        zone,
+                        title, zone, include_zone_prefix=False
                     )
                     types.append(Variable(value=f'"{resolved_name}"'))
                 elif variant.get("type") == "array" and "items" in variant:
                     items = variant["items"]
                     if "$ref" in items:
                         ref_name = items["$ref"].replace("#/components/schemas/", "")
+                        if dependencies is not None:
+                            dependencies.add(ref_name)
                         resolved_name = self.schema_resolver.resolve_schema_name(
-                            ref_name, zone
+                            ref_name, zone, include_zone_prefix=False
                         )
                         types.append(
                             Variable(value=f'"{resolved_name}"', wrap_name="List")
@@ -1330,21 +1430,26 @@ class ClientGenerator:
                     elif items.get("type") == "object" and "title" in items:
                         # Inline объект с title - используем fallback логику
                         title = items["title"]
+                        if dependencies is not None:
+                            dependencies.add(title)
                         resolved_name = self.schema_resolver.resolve_schema_name(
-                            title,
-                            zone,
+                            title, zone, include_zone_prefix=False
                         )
                         types.append(
                             Variable(value=f'"{resolved_name}"', wrap_name="List")
                         )
                     else:
-                        item_type = self._get_type_for_model_field(items, zone)
+                        item_type = self._get_type_for_model_field(
+                            items, zone, dependencies
+                        )
                         if str(item_type) != "Any":  # Избегаем List[Any] если можем
                             types.append(Variable(value=item_type, wrap_name="List"))
                         else:
                             types.append(Variable(value="list"))
                 else:
-                    types.append(self._get_type_for_model_field(variant, zone))
+                    types.append(
+                        self._get_type_for_model_field(variant, zone, dependencies)
+                    )
 
             if len(types) == 1:
                 result = types[0]
@@ -1359,6 +1464,8 @@ class ClientGenerator:
         # Прямой $ref
         if "$ref" in schema:
             ref_name = schema["$ref"].replace("#/components/schemas/", "")
+            if dependencies is not None:
+                dependencies.add(ref_name)
 
             # Проверяем что схема зарегистрирована
             if ref_name in self.schema_resolver._schema_registry:
@@ -1374,12 +1481,13 @@ class ClientGenerator:
                         # Это Dict, а не модель
                         additional_props = ref_schema["additionalProperties"]
                         value_type = self._get_type_for_model_field(
-                            additional_props, zone
+                            additional_props, zone, dependencies
                         )
                         return Variable(value=f"str, {value_type}", wrap_name="Dict")
 
-                schema_zone = self.schema_resolver.get_schema_zone(ref_name)
-                resolved_name = self.schema_resolver.resolve_schema_name(ref_name, zone)
+                resolved_name = self.schema_resolver.resolve_schema_name(
+                    ref_name, zone, include_zone_prefix=False
+                )
 
                 # Используем модель с правильным именем
                 return Variable(value=f'"{resolved_name}"')
@@ -1392,21 +1500,23 @@ class ClientGenerator:
             items = schema["items"]
             if "$ref" in items:
                 ref_name = items["$ref"].replace("#/components/schemas/", "")
+                if dependencies is not None:
+                    dependencies.add(ref_name)
                 resolved_name = self.schema_resolver.resolve_schema_name(
-                    ref_name,
-                    zone,
+                    ref_name, zone, include_zone_prefix=False
                 )
                 return Variable(value=f'"{resolved_name}"', wrap_name="List")
             elif items.get("type") == "object" and "title" in items:
                 # Inline объект с title - используем fallback логику
                 title = items["title"]
+                if dependencies is not None:
+                    dependencies.add(title)
                 resolved_name = self.schema_resolver.resolve_schema_name(
-                    title,
-                    zone,
+                    title, zone, include_zone_prefix=False
                 )
                 return Variable(value=f'"{resolved_name}"', wrap_name="List")
             else:
-                item_type = self._get_type_for_model_field(items, zone)
+                item_type = self._get_type_for_model_field(items, zone, dependencies)
                 return Variable(value=item_type, wrap_name="List")
 
         # Inline object с title (развернутая схема)
@@ -1414,10 +1524,61 @@ class ClientGenerator:
             # Проверяем additionalProperties - это должно быть Dict, а не модель
             if "additionalProperties" in schema:
                 additional_props = schema["additionalProperties"]
-                value_type = self._get_type_for_model_field(additional_props, zone)
+                value_type = self._get_type_for_model_field(
+                    additional_props, zone, dependencies
+                )
                 return Variable(value=f"str, {value_type}", wrap_name="Dict")
 
             title = schema["title"]
+
+            # Ищем зарегистрированную схему с таким title
+            # Сравниваем не только title, но и структуру
+            found_schema = None
+            best_match = None
+            best_score = 0
+
+            for reg_name, info in self.schema_resolver._schema_registry.items():
+                # Получаем оригинальную схему для сравнения
+                schemas_dict = self.openapi_dict.get("components", {}).get(
+                    "schemas", {}
+                )
+                if reg_name in schemas_dict:
+                    reg_schema = schemas_dict[reg_name]
+                    if reg_schema.get("title") == title:
+                        # Сравниваем свойства
+                        reg_props = set(reg_schema.get("properties", {}).keys())
+                        inline_props = set(schema.get("properties", {}).keys())
+
+                        # Если свойства полностью совпадают - это точное совпадение
+                        if reg_props == inline_props:
+                            found_schema = reg_name
+                            break
+
+                        # Иначе считаем процент совпадения
+                        if reg_props and inline_props:
+                            common_props = reg_props.intersection(inline_props)
+                            score = len(common_props) / max(
+                                len(reg_props), len(inline_props)
+                            )
+                            if score > best_score:
+                                best_score = score
+                                best_match = reg_name
+
+            # Используем лучшее совпадение если точного не нашли
+            if not found_schema and best_match and best_score > 0.8:
+                found_schema = best_match
+
+            if found_schema:
+                if dependencies is not None:
+                    dependencies.add(found_schema)
+                resolved_name = self.schema_resolver.resolve_schema_name(
+                    found_schema, zone, include_zone_prefix=False
+                )
+                return Variable(value=f'"{resolved_name}"')
+
+            # Fallback - используем title как есть
+            if dependencies is not None:
+                dependencies.add(title)
 
             # Для развернутых inline схем пытаемся найти соответствующую зарегистрированную схему
             if "properties" in schema:
@@ -1459,10 +1620,12 @@ class ClientGenerator:
                 else:
                     # Fallback к стандартной логике
                     resolved_name = self.schema_resolver.resolve_schema_name(
-                        title, zone
+                        title, zone, include_zone_prefix=False
                     )
             else:
-                resolved_name = self.schema_resolver.resolve_schema_name(title, zone)
+                resolved_name = self.schema_resolver.resolve_schema_name(
+                    title, zone, include_zone_prefix=False
+                )
 
             return Variable(value=f'"{resolved_name}"')
 
@@ -1564,6 +1727,8 @@ class ClientGenerator:
 
     def _get_clean_model_type(self, responses: Dict, zone: str) -> str:
         """Получение чистого типа модели для response_model без Optional оберток"""
+        # Пытаемся использовать оригинальную спеку если она доступна
+        # чтобы избежать проблем с jsonref который резолвит $ref
         for status_code, response_spec in responses.items():
             if status_code.startswith("2"):
                 content = response_spec.get("content", {})
@@ -1579,11 +1744,7 @@ class ClientGenerator:
                                     ref_name = variant["$ref"].replace(
                                         "#/components/schemas/", ""
                                     )
-                                    clean_name = (
-                                        self.schema_resolver.resolve_schema_name(
-                                            ref_name, zone
-                                        )
-                                    )
+                                    clean_name = self._get_clean_schema_name(ref_name)
                                     # Возвращаем первую найденную модель без Optional
                                     return clean_name
                                 elif (
@@ -1592,20 +1753,27 @@ class ClientGenerator:
                                 ):
                                     # Инлайн объект с title
                                     title = variant["title"]
-                                    clean_name = (
-                                        self.schema_resolver.resolve_schema_name(
-                                            title, zone
-                                        )
-                                    )
+                                    # Ищем схему с таким title
+                                    for schema_name, schema_spec in (
+                                        self.openapi_dict.get("components", {})
+                                        .get("schemas", {})
+                                        .items()
+                                    ):
+                                        if schema_spec.get("title") == title:
+                                            schema_clean_name = (
+                                                self._get_clean_schema_name(schema_name)
+                                            )
+                                            if schema_clean_name:
+                                                return schema_clean_name
+                                    # Fallback
+                                    clean_name = self._get_clean_schema_name(title)
                                     return clean_name
                         elif "$ref" in schema:
                             # Прямая ссылка на модель
                             ref_name = schema["$ref"].replace(
                                 "#/components/schemas/", ""
                             )
-                            clean_name = self.schema_resolver.resolve_schema_name(
-                                ref_name, zone
-                            )
+                            clean_name = self._get_clean_schema_name(ref_name)
                             return clean_name
                         elif schema.get("type") == "array" and "items" in schema:
                             # Массив моделей - возвращаем тип элемента для response_model
@@ -1614,9 +1782,7 @@ class ClientGenerator:
                                 ref_name = items["$ref"].replace(
                                     "#/components/schemas/", ""
                                 )
-                                clean_name = self.schema_resolver.resolve_schema_name(
-                                    ref_name, zone
-                                )
+                                clean_name = self._get_clean_schema_name(ref_name)
                                 # Для массивов возвращаем модель элемента, handle_request сам создаст список
                                 return clean_name
                         elif schema.get("type") == "object" and "title" in schema:
@@ -1628,90 +1794,31 @@ class ClientGenerator:
 
                             # Инлайн объект с title
                             title = schema["title"]
-                            clean_name = self.schema_resolver.resolve_schema_name(
-                                title, zone
-                            )
+                            # Ищем схему с таким title в текущей зоне
+                            for schema_name, schema_spec in (
+                                self.openapi_dict.get("components", {})
+                                .get("schemas", {})
+                                .items()
+                            ):
+                                if schema_spec.get("title") == title:
+                                    # Проверяем что схема относится к правильной зоне
+                                    schema_clean_name = self._get_clean_schema_name(
+                                        schema_name
+                                    )
+                                    # Для Paginated схем проверяем зону
+                                    if title == "Paginated" and zone:
+                                        zone_prefix = zone.capitalize()
+                                        if (
+                                            schema_clean_name
+                                            == f"{zone_prefix}Paginated"
+                                        ):
+                                            return schema_clean_name
+                                    elif schema_clean_name:
+                                        return schema_clean_name
+                            # Fallback - используем title как есть
+                            clean_name = self._get_clean_schema_name(title)
                             return clean_name
         return "Any"
-
-    def _generate_utils_content(self) -> str:
-        """Генерация содержимого lib/utils.py"""
-        return '''"""
-Вспомогательные утилиты для endpoints
-"""
-
-from typing import Optional, Dict, Any
-from . import models
-
-
-def prepare_params(locals_dict: dict) -> Optional[Dict[str, Any]]:
-    """Подготовка query параметров"""
-    params = {
-        k[:-6]: v 
-        for k, v in locals_dict.items() 
-        if k.endswith('_query') and not models.is_not_set(v)
-    }
-    return params if params else None
-
-
-def prepare_body_data(locals_dict: dict) -> Optional[Dict[str, Any]]:
-    """Подготовка body данных с автоматической конвертацией моделей"""
-    body_data = {}
-    for k, v in locals_dict.items():
-        if k.endswith('_body') and not models.is_not_set(v):
-            if hasattr(v, 'model_dump'):
-                body_data[k[:-5]] = v.model_dump()
-            elif isinstance(v, list) and v and hasattr(v[0], 'model_dump'):
-                body_data[k[:-5]] = [item.model_dump() for item in v]
-            else:
-                body_data[k[:-5]] = v
-    return body_data if body_data else None
-
-
-def prepare_files(locals_dict: dict) -> Optional[Dict[str, Any]]:
-    """Подготовка file параметров"""
-    files = {
-        k[:-5]: v 
-        for k, v in locals_dict.items() 
-        if k.endswith('_file') and not models.is_not_set(v)
-    }
-    return files if files else None
-
-
-async def handle_request(client, method: str, path: str, locals_dict: dict, response_model=None) -> Any:
-    """Обработка HTTP запроса с автоматической подготовкой параметров и парсингом response модели"""
-    params = prepare_params(locals_dict)
-    data = prepare_body_data(locals_dict)
-    files = prepare_files(locals_dict)
-    
-    response = await client._send_request(
-        method=method,
-        path=path,
-        params=params,
-        data=data,
-        files=files
-    )
-    
-    if not hasattr(response, 'status_code'):
-        return response
-    
-    response_data = await response.json()
-    
-    # Если указана модель для парсинга, пытаемся парсить
-    if response_model is not None:
-        try:
-            # Если response_data - это список, создаем список моделей
-            if isinstance(response_data, list):
-                return [response_model(**item) for item in response_data]
-            # Иначе создаем одну модель
-            else:
-                return response_model(**response_data)
-        except Exception:
-            # Если парсинг не удался, возвращаем raw data
-            pass
-    
-    return response_data
-'''
 
     def _add_cross_zone_imports(self, file: CodeFile, current_zone: str):
         """Добавление кросс-зонных импортов для endpoints"""
@@ -1726,75 +1833,3 @@ async def handle_request(client, method: str, path: str, locals_dict: dict, resp
         # Добавляем импорты
         for zone in sorted(cross_imports):
             file.imports.append(f"from ..models import {zone}")
-
-    def _add_model_cross_imports(self, models_file: CodeFile, current_zone: str):
-        """Добавление кросс-импортов между моделями разных зон"""
-        cross_zones = set()
-
-        # Собираем все зоны которые могут быть ссылками в этой зоне
-        for schema_name, info in self.schema_resolver._schema_registry.items():
-            schema_zone = info["zone"]
-            if schema_zone != current_zone and schema_zone != "common":
-                cross_zones.add(schema_zone)
-
-        # Добавляем TYPE_CHECKING блок для кросс-зонных ссылок
-        if cross_zones:
-            models_file.imports.append("")
-            models_file.imports.append("if TYPE_CHECKING:")
-
-            for zone in sorted(cross_zones):
-                models_file.imports.append(f"    from . import {zone.lower()}")
-
-    def _add_model_rebuilds(self):
-        """Добавление model_rebuild() для всех моделей с forward references"""
-        # Добавляем model_rebuild() в конце каждого файла моделей
-        for file in self.project.files:
-            if file.file_name.startswith("models/") and file.file_name.endswith(".py"):
-                if file.classes:
-                    model_names = list(file.classes.keys())
-                    print(f"DEBUG: File {file.file_name} has models: {model_names}")
-
-                    rebuild_code = []
-                    rebuild_code.append("")
-                    rebuild_code.append("# Model rebuilds for forward references")
-                    for model_name in sorted(model_names):
-                        rebuild_code.append(f"{model_name}.model_rebuild()")
-
-                    file.add_code_block(
-                        CodeBlock(
-                            code="\n".join(rebuild_code), order=-1000
-                        )  # Добавляем в конец
-                    )
-
-    def _add_model_rebuilds_direct(self):
-        """Прямое добавление model_rebuild() в файлы"""
-        for file in self.project.files:
-            if file.file_name.startswith("models/") and file.file_name.endswith(".py"):
-                if file.classes:
-                    model_names = sorted(file.classes.keys())
-
-                    # Добавляем в конец файла через CodeBlock
-                    rebuild_code = ["", "# Model rebuilds for forward references"]
-                    for model_name in model_names:
-                        rebuild_code.append(f"{model_name}.model_rebuild()")
-
-                    file.add_code_block(
-                        CodeBlock(code="\n".join(rebuild_code), order=-100)
-                    )
-
-    def _add_model_rebuilds_final(self):
-        """Добавление model_rebuild() в конце файлов после всех моделей"""
-        for file in self.project.files:
-            if file.file_name.startswith("models/") and file.file_name.endswith(".py"):
-                if file.classes:
-                    model_names = sorted(file.classes.keys())
-
-                    # Добавляем как код блок
-                    rebuild_code = [""]
-                    rebuild_code.append("# Model rebuilds for forward references")
-                    for model_name in model_names:
-                        rebuild_code.append(f"{model_name}.model_rebuild()")
-
-                    file.add_code_block(
-                        CodeBlock(code="\n".join(rebuild_code), order=-1)
-                    )

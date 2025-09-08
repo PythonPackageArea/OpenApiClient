@@ -17,7 +17,7 @@ def confirm_choice(message: str) -> bool:
     """Запрос подтверждения у пользователя"""
     while True:
         choice = input(f"{message} (y/n): ").lower().strip()
-        if choice in ["y", "yes", "да"]:
+        if choice in ["y", "yes", "да", ""]:
             return True
         elif choice in ["n", "no", "нет"]:
             return False
@@ -192,11 +192,15 @@ def _generate_client_core(config: OpenApiConfig) -> Project:
                 f"Не удалось загрузить спецификацию из {config.url}. Проверьте URL или путь к файлу."
             )
 
+    # Сохраняем оригинальную спецификацию до разрешения ссылок
+    original_spec = openapi_spec.copy()
     openapi_spec = dict(jsonref.loads(json.dumps(openapi_spec)))
 
     # Генерация
     print("⚙️ Генерация кода...")
-    generator = ApiClientGenerator(openapi_spec, source_url=config.url)
+    generator = ApiClientGenerator(
+        openapi_spec, source_url=config.url, original_spec=original_spec
+    )
     return generator.generate()
 
 
@@ -324,13 +328,24 @@ def generate():
         sys.exit(1)
 
     # Генерация клиента
-    print(f"📁 Папка: {final_config.dirname}")
+    if args.dirname and file_config:
+        print(f"📁 Генерация в существующую папку: {args.dirname}")
+    else:
+        print(f"📁 Создание новой папки: {final_config.dirname}")
 
     try:
-        _generate_client(final_config, ".")
+        # Если указан dirname через аргументы и найден конфиг в этой директории,
+        # генерируем прямо в эту директорию
+        if args.dirname and file_config:
+            _generate_client_in_existing(final_config, args.dirname)
+        else:
+            _generate_client(final_config, ".")
 
         # Обновление конфига если нужно
-        work_path = os.path.join(os.getcwd(), final_config.dirname)
+        if args.dirname and file_config:
+            work_path = args.dirname
+        else:
+            work_path = os.path.join(os.getcwd(), final_config.dirname)
         if not file_config and (
             args.force or confirm_choice("Сохранить настройки в openapi.toml?")
         ):
