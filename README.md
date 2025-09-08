@@ -33,13 +33,14 @@ pip install git+https://github.com/PythonPackageArea/OpenApiClient.git
 
 ```bash
 # Генерация из URL
-python -m openapi_client.cli --url https://petstore.swagger.io/v2/swagger.json --dirname petstore_client
+openapi_client --url https://petstore.swagger.io/v2/swagger.json --dirname petstore_client
+openapi_client --url https://0.0.0.0:8000 --dirname petstore_client # Самостоятельно пропишет /openapi.json
 
 # Генерация из файла
-python -m openapi_client.cli --url ./openapi.json --dirname my_client
+openapi_client --url ./openapi.json --dirname my_client
 
-# Интерактивный режим
-python -m openapi_client.cli
+# Режим интерактивного меню
+openapi_client
 ```
 
 ### Программное использование
