@@ -94,10 +94,6 @@ class Parameter(BaseModel):
             + (f": {type_str}" if type_str else "")
             + (f" = {self.default}" if self.default else "")
         )
-        # return (" " if self.type else "").join(filter(bool, [
-        #     self.name + ": " + self.type if self.type else self.name,
-        #     ("= " if self.type else "=") + self.default if self.default else ""
-        # ]))
 
 
 class CodeBlock(BaseModel):
@@ -202,21 +198,19 @@ class Function(BaseModel):
                                     ),
                                 )
                             )
-                            + ("\n||" if many_parameters else "")
+                            + ("\n" if many_parameters else "")
                             if self.parameters
                             else ""
                         )
-                        + f") -> {self.response}:\n"
-                        # "\t" + (',\n\t'.join(map(str, sorted(self.parameters, key=lambda x: bool(x.default))))),
-                        # f"||) -> {self.response}:\n"
+                        + f") -> {self.response}:"
                     ]
                 )
                 + (
                     "\n    " + docstring.replace("\n", "\n    ") + "\n"
                     if docstring
-                    else ""
+                    else "\n"
                 )
-                + "\n    "
+                + "    "
                 + str(self.code).replace(
                     "\n", "\n    "
                 )  # Добавляем 4 пробела к коду функции

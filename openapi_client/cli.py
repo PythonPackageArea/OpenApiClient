@@ -358,18 +358,5 @@ def generate():
         sys.exit(1)
 
 
-# Deprecated функции для обратной совместимости
-def gen():
-    """Deprecated: используйте openapi-client"""
-    print("⚠️ Команда gen-api устарела. Используйте: openapi-client")
-    generate()
-
-
-def update():
-    """Deprecated: используйте openapi-client"""
-    print("⚠️ Команда update-api устарела. Используйте: openapi-client")
-    generate()
-
-
 if __name__ == "__main__":
     generate()

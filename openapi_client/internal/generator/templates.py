@@ -22,8 +22,7 @@ class ServerError(SendRequestError):
     pass
 """
 
-    lib_models = """import enum
-from typing import Any
+    models = """from typing import Any
 
 
 class _NotSetType:
@@ -35,28 +34,13 @@ class _NotSetType:
 
 
 NOTSET = _NotSetType()
-
-
-class MethodName(str, enum.Enum):
-    GET = "GET"
-    POST = "POST"
-    PUT = "PUT"
-    DELETE = "DELETE"
-    PATCH = "PATCH"
-    HEAD = "HEAD"
-    OPTIONS = "OPTIONS"
-
-
-def is_not_set(value: Any) -> bool:
-    return value is NOTSET
 """
 
     client = """from simple_singleton import Singleton
 from typing import TYPE_CHECKING
 
-from .lib import exc as exceptions
-from .lib import models  
 from .common import AiohttpClient
+from . import constants
 
 if TYPE_CHECKING:
 {zone_imports}
@@ -77,10 +61,18 @@ import aiohttp
 from aiohttp import ClientError, ClientTimeout, ClientSession, TCPConnector
 from pydantic import BaseModel
 
-from .lib import exc as exceptions
-from .lib import models
+from . import constants
 
 logger = logging.getLogger(__name__)
+
+
+class SendRequestError(Exception):
+    def __init__(self, message, path, status_code, response_data=None):
+        self.message = message
+        self.path = path
+        self.status_code = status_code
+        self.response_data = response_data
+        super().__init__(f"[{status_code}] {path}: {message}")
 
 
 class ConnectionPool:
@@ -114,12 +106,80 @@ class AiohttpClient:
     def __init__(self):
         self._session: Optional[ClientSession] = None
         self._api_url: Optional[str] = None
-        self._headers: Dict[str, str] = {}
-        self._cookies: Dict[str, str] = {}
+        self._base_headers: Dict[str, str] = {}
+        self._base_cookies: Dict[str, str] = {}
+        self._temp_headers: Dict[str, str] = {}
+        self._temp_cookies: Dict[str, str] = {}
         self._timeout: int = 30
         self._retries: int = 3
         self._connection_pool = ConnectionPool()
         self._rate_limiter = None
+        self._session_dirty = False
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        \"\"\"Получение текущих заголовков\"\"\"
+        return {**self._base_headers, **self._temp_headers}
+
+    @headers.setter  
+    def headers(self, value: Dict[str, str]):
+        \"\"\"Установка заголовков с обновлением сессии\"\"\"
+        self._base_headers = dict(value) if value else {}
+        self._session_dirty = True
+
+    @property
+    def cookies(self) -> Dict[str, str]:
+        \"\"\"Получение текущих куков\"\"\"
+        return {**self._base_cookies, **self._temp_cookies}
+
+    @cookies.setter
+    def cookies(self, value: Dict[str, str]):
+        \"\"\"Установка куков с обновлением сессии\"\"\"
+        self._base_cookies = dict(value) if value else {}
+        self._session_dirty = True
+
+    def update_headers(self, **headers):
+        \"\"\"Обновление заголовков\"\"\"
+        self._base_headers.update(headers)
+        self._session_dirty = True
+        return self
+
+    def update_cookies(self, **cookies):
+        \"\"\"Обновление куков\"\"\"
+        self._base_cookies.update(cookies)
+        self._session_dirty = True
+        return self
+
+    @asynccontextmanager
+    async def with_headers(self, **temp_headers):
+        \"\"\"Контекстный менеджер для временных заголовков\"\"\"
+        old_temp = self._temp_headers.copy()
+        try:
+            self._temp_headers.update(temp_headers)
+            self._session_dirty = True
+            yield self
+        finally:
+            self._temp_headers = old_temp
+            self._session_dirty = True
+
+    @asynccontextmanager
+    async def with_cookies(self, **temp_cookies):
+        \"\"\"Контекстный менеджер для временных куков\"\"\"
+        old_temp = self._temp_cookies.copy()
+        try:
+            self._temp_cookies.update(temp_cookies)
+            self._session_dirty = True
+            yield self
+        finally:
+            self._temp_cookies = old_temp
+            self._session_dirty = True
+
+    async def refresh_session(self):
+        \"\"\"Принудительное обновление сессии\"\"\"
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        self._session_dirty = False
 
     @asynccontextmanager
     async def _session_context(self):
@@ -131,7 +191,12 @@ class AiohttpClient:
             pass  # Сессия остается открытой для повторного использования
 
     async def _ensure_session(self) -> ClientSession:
-        if self._session is None or self._session.closed:
+        # Пересоздаем сессию если она грязная или не существует
+        if self._session is None or self._session.closed or self._session_dirty:
+            # Закрываем старую сессию
+            if self._session and not self._session.closed:
+                await self._session.close()
+                
             timeout = ClientTimeout(
                 total=self._timeout,
                 connect=10,
@@ -139,19 +204,24 @@ class AiohttpClient:
                 sock_connect=10
             )
 
+            # Объединяем базовые и временные headers/cookies
+            current_headers = self.headers
+            current_cookies = self.cookies
+
             self._session = ClientSession(
                 connector=self._connection_pool.get_connector(),
                 timeout=timeout,
-                headers=self._headers.copy(),
-                cookies=self._cookies.copy(),
+                headers=current_headers,
+                cookies=current_cookies,
                 trust_env=True,  # Использовать системные прокси
             )
+            self._session_dirty = False
 
         return self._session
 
     async def _send_request(
             self,
-            method: models.MethodName,
+            method: str,
             path: str,
             content_type: str = None,
             params: dict = None,
@@ -161,7 +231,7 @@ class AiohttpClient:
     ) -> Any:
 
         if not self._api_url:
-            raise exceptions.SendRequestError(
+            raise SendRequestError(
                 'API URL is empty',
                 path=path,
                 status_code=400,
@@ -251,13 +321,13 @@ class AiohttpClient:
                     logger.warning(f"Request failed (retries left: {_retries}): {exc}")
 
                     if isinstance(exc, ValueError):
-                        raise exceptions.SendRequestError(
+                        raise SendRequestError(
                             str(exc), path=path, status_code=400
                         )
 
                     if not _retries:
                         if isinstance(exc, (ClientError, asyncio.TimeoutError)):
-                            raise exceptions.SendRequestError(
+                            raise SendRequestError(
                                 str(exc), path=path, status_code=503
                             )
 
@@ -265,7 +335,7 @@ class AiohttpClient:
 
                 except Exception as exc:
                     logger.error(f"Unexpected error: {exc}")
-                    raise exceptions.SendRequestError(
+                    raise SendRequestError(
                         str(exc), path=path, status_code=500
                     )
 
@@ -281,8 +351,13 @@ class AiohttpClient:
     ) -> "AiohttpClient":
         \"\"\"Инициализация клиента с настройками\"\"\"
         self._api_url = str(api_url).rstrip('/')
-        self._headers = dict(headers) if headers else {}
-        self._cookies = dict(cookies) if cookies else {}
+        
+        # Используем property для автоматического обновления сессии
+        if headers:
+            self.headers = headers
+        if cookies:
+            self.cookies = cookies
+            
         self._timeout = int(timeout) if timeout else 30
         self._retries = int(retries) if retries else 3
 
@@ -311,13 +386,24 @@ class AiohttpClient:
         \"\"\"Установка ограничителя частоты запросов\"\"\"
         self._rate_limiter = rate_limiter
 
+    def set_auth_token(self, token: str):
+        \"\"\"Установка Bearer токена авторизации\"\"\"
+        return self.update_headers(Authorization=f\"Bearer {token}\")
+
+    def remove_auth(self):
+        \"\"\"Удаление авторизации\"\"\"
+        if \"Authorization\" in self._base_headers:
+            del self._base_headers[\"Authorization\"]
+            self._session_dirty = True
+        return self
+
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()"""
 
-    lib_decorators = """\"\"\"
+    decorators = """\"\"\"
 HTTP декораторы для endpoints (FastAPI-style)
 \"\"\"
 
@@ -414,12 +500,16 @@ def patch(
     return http_method("patch", path, response_model)
 """
 
-    lib_utils = """\"\"\"
+    utils = """\"\"\"
 Вспомогательные утилиты для endpoints
 \"\"\"
 
 from typing import Optional, Dict, Any
-from . import models
+from . import constants
+
+
+def is_not_set(value: Any) -> bool:
+    return value is constants.NOTSET
 
 
 def prepare_params(locals_dict: dict) -> Optional[Dict[str, Any]]:
@@ -427,7 +517,7 @@ def prepare_params(locals_dict: dict) -> Optional[Dict[str, Any]]:
     params = {
         k[:-6]: v 
         for k, v in locals_dict.items() 
-        if k.endswith('_query') and not models.is_not_set(v)
+        if k.endswith('_query') and not is_not_set(v)
     }
     return params if params else None
 
@@ -436,7 +526,7 @@ def prepare_body_data(locals_dict: dict) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка body данных с автоматической конвертацией моделей\"\"\"
     body_data = {}
     for k, v in locals_dict.items():
-        if k.endswith('_body') and not models.is_not_set(v):
+        if k.endswith('_body') and not is_not_set(v):
             if hasattr(v, 'model_dump'):
                 body_data[k[:-5]] = v.model_dump()
             elif isinstance(v, list) and v and hasattr(v[0], 'model_dump'):
@@ -451,7 +541,7 @@ def prepare_files(locals_dict: dict) -> Optional[Dict[str, Any]]:
     files = {
         k[:-5]: v 
         for k, v in locals_dict.items() 
-        if k.endswith('_file') and not models.is_not_set(v)
+        if k.endswith('_file') and not is_not_set(v)
     }
     return files if files else None
 
@@ -473,10 +563,34 @@ async def handle_request(client, method: str, path: str, locals_dict: dict, resp
     if not hasattr(response, 'status_code'):
         return response
     
-    response_data = await response.json()
+    # Определяем content-type и читаем соответствующим способом
+    content_type = response.headers.get('content-type', '').lower()
     
-    # Если указана модель для парсинга, пытаемся парсить
-    if response_model is not None:
+    try:
+        if 'application/json' in content_type:
+            response_data = await response.json()
+        elif content_type.startswith('text/'):
+            response_data = await response.text()
+        elif 'application/xml' in content_type or 'text/xml' in content_type:
+            response_data = await response.text()
+        elif 'application/octet-stream' in content_type or 'application/zip' in content_type:
+            response_data = await response.read()
+        else:
+            # Универсальная попытка JSON, fallback на text
+            try:
+                response_data = await response.json()
+            except Exception:
+                try:
+                    response_data = await response.text()
+                except Exception:
+                    response_data = await response.read()
+    
+    except Exception:
+        # Если все способы не сработали, возвращаем сырой response
+        return response
+    
+    # Если указана модель для парсинга, пытаемся парсить (только для JSON)
+    if response_model is not None and isinstance(response_data, (dict, list)):
         try:
             # Если response_data - это список, создаем список моделей
             if isinstance(response_data, list):
