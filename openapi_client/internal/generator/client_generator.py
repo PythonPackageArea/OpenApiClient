@@ -214,6 +214,10 @@ class ClientGenerator:
         # Получаем чистое имя модели для декоратора
         clean_model_type = self._get_clean_model_type(spec.get("responses", {}), zone)
 
+        # Если return_type = "Any", но у нас есть конкретная модель, используем её
+        if return_type == "Any" and clean_model_type != "Any":
+            return_type = clean_model_type
+
         # Создаем декоратор
         if clean_model_type != "Any":
             decorator = f"@{method}('{path}', response_model={clean_model_type})"
@@ -253,10 +257,13 @@ class ClientGenerator:
                 )
 
     def _collect_zone_models(self, zone_name: str) -> set:
-        """Собирает все модели связанные с зоной"""
+        """Собирает только существующие модели связанные с зоной"""
         zone_models = set()
         zone_info = self.zones[zone_name]
         zone_class = zone_info["endpoints_class"]
+
+        # Получаем список всех существующих моделей
+        existing_models = self._get_all_existing_models()
 
         # Проходим по всем методам зоны
         for func in zone_class.functions.values():
@@ -269,40 +276,39 @@ class ClientGenerator:
                     match = re.search(r"response_model=(\w+)", decorator)
                     if match:
                         model_name = match.group(1)
-                        zone_models.add(model_name)
+                        # Добавляем только если модель существует
+                        if model_name in existing_models:
+                            zone_models.add(model_name)
 
-                        # Рекурсивно собираем зависимые модели
-                        dependencies = self._collect_model_dependencies(model_name)
-                        zone_models.update(dependencies)
+            # Ищем модели в типах параметров (для enum'ов и других типов)
+            for param in func.parameters:
+                if param.var_type and param.var_type.value:
+                    # Извлекаем имя типа (может быть Optional[ModelName] или ModelName)
+                    import re
+
+                    # Ищем имена моделей в типах (включая Optional, List, etc.)
+                    type_matches = re.findall(r"([A-Z]\w+)", str(param.var_type.value))
+                    for type_name in type_matches:
+                        if type_name in existing_models:
+                            zone_models.add(type_name)
 
         return zone_models
 
-    def _collect_model_dependencies(self, model_name: str) -> set:
-        """Рекурсивно собирает все зависимости модели"""
-        dependencies = set()
+    def _get_all_existing_models(self) -> set:
+        """Получает список всех существующих моделей в проекте"""
+        existing_models = set()
 
-        # Ищем модель по имени в models/
+        # Проходим по всем model файлам
         for file in self.project.files:
             if (
                 file.file_name.startswith("models/")
                 and file.file_name != "models/__init__.py"
             ):
-                for class_name, class_obj in file.classes.items():
-                    if class_name == model_name:
-                        # Собираем зависимости из TYPE_CHECKING imports
-                        for import_line in file.imports:
-                            if (
-                                import_line.strip().startswith("from .")
-                                and " import " in import_line
-                            ):
-                                # Извлекаем имена импортированных моделей
-                                import_part = import_line.split(" import ")[-1]
-                                imported_models = [
-                                    m.strip() for m in import_part.split(",")
-                                ]
-                                dependencies.update(imported_models)
+                # Добавляем имена классов из файла
+                for class_name in file.classes.keys():
+                    existing_models.add(class_name)
 
-        return dependencies
+        return existing_models
 
     def _create_parameter(
         self, param_spec: Dict, path_str: str = "", path_params: List[str] = None
@@ -490,11 +496,28 @@ class ClientGenerator:
                                             schema_clean_name = (
                                                 self._get_clean_schema_name(schema_name)
                                             )
-                                            # Проверяем зону
+                                            # Проверяем зону - очень гибкий поиск
                                             if zone:
-                                                zone_prefix = zone.capitalize()
-                                                expected_name = f"{zone_prefix}{title}"
-                                                if schema_clean_name == expected_name:
+                                                zone_lower = zone.lower()
+                                                schema_lower = schema_clean_name.lower()
+                                                title_lower = title.lower()
+
+                                                # Ищем модель содержащую зону (или её часть) и title
+                                                zone_match = (
+                                                    zone_lower in schema_lower
+                                                    or any(
+                                                        part in schema_lower
+                                                        for part in zone_lower.split(
+                                                            "_"
+                                                        )
+                                                        if len(part) > 2
+                                                    )
+                                                )
+                                                title_match = (
+                                                    title_lower in schema_lower
+                                                )
+
+                                                if zone_match and title_match:
                                                     type_variants.append(
                                                         schema_clean_name
                                                     )
@@ -502,8 +525,8 @@ class ClientGenerator:
                                                     break
                                             else:
                                                 type_variants.append(schema_clean_name)
-                                                found = True
-                                                break
+                                            found = True
+                                            break
                                     if not found:
                                         clean_name = self._get_clean_schema_name(title)
                                         type_variants.append(clean_name)
@@ -554,8 +577,7 @@ class ClientGenerator:
                             else:
                                 # Инлайн объект с title - используем зарегистрированную схему
                                 title = schema["title"]
-                                # Инлайн объект с title
-                                title = schema["title"]
+                                found_schema = False
                                 # Ищем схему с таким title в текущей зоне
                                 for schema_name, schema_spec in (
                                     self.openapi_dict.get("components", {})
@@ -566,20 +588,36 @@ class ClientGenerator:
                                         schema_clean_name = self._get_clean_schema_name(
                                             schema_name
                                         )
-                                        # Проверяем зону для всех схем
+                                        # Проверяем зону - очень гибкий поиск
                                         if zone:
-                                            zone_prefix = zone.capitalize()
-                                            expected_name = f"{zone_prefix}{title}"
-                                            if schema_clean_name == expected_name:
+                                            zone_lower = zone.lower()
+                                            schema_lower = schema_clean_name.lower()
+                                            title_lower = title.lower()
+
+                                            # Ищем модель содержащую зону (или её часть) и title
+                                            zone_match = (
+                                                zone_lower in schema_lower
+                                                or any(
+                                                    part in schema_lower
+                                                    for part in zone_lower.split("_")
+                                                    if len(part) > 2
+                                                )
+                                            )
+                                            title_match = title_lower in schema_lower
+
+                                            if zone_match and title_match:
                                                 success_responses.append(
                                                     schema_clean_name
                                                 )
+                                                found_schema = True
                                                 break
                                         else:
                                             # Если нет зоны, берем первую найденную
                                             success_responses.append(schema_clean_name)
+                                            found_schema = True
                                             break
-                                else:
+
+                                if not found_schema:
                                     # Fallback - используем title как есть
                                     clean_name = self._get_clean_schema_name(title)
                                     success_responses.append(clean_name)
@@ -587,10 +625,16 @@ class ClientGenerator:
                             var_type = self._get_type(schema, zone)
                             success_responses.append(str(var_type))
 
-        if len(success_responses) == 1:
-            return success_responses[0]
-        elif len(success_responses) > 1:
-            return f"Union[{', '.join(success_responses)}]"
+        # Убираем дубликаты, сохраняя порядок
+        unique_responses = []
+        for response in success_responses:
+            if response not in unique_responses:
+                unique_responses.append(response)
+
+        if len(unique_responses) == 1:
+            return unique_responses[0]
+        elif len(unique_responses) > 1:
+            return f"Union[{', '.join(unique_responses)}]"
         else:
             return "Any"
 
@@ -610,7 +654,11 @@ class ClientGenerator:
         """Получение зоны для endpoint"""
         tags = method_spec.get("tags", [])
         if tags:
-            return self._snake_case(tags[0])
+            tag = tags[0]
+            # Исправления для зон с несоответствием названий
+            if tag == "support":
+                return "support_messages"
+            return self._snake_case(tag)
         return "default"
 
     def _ensure_zone(self, zone: str):
@@ -625,7 +673,7 @@ class ClientGenerator:
                 [
                     "from ..decorators import get, post, put, delete, patch",
                     "from ..common import AiohttpClient",
-                    "from typing import Optional, List, Any, Union, Literal",
+                    "from typing import Optional, List, Any, Union, Literal, Dict",
                     "from datetime import datetime",
                     "from ..constants import NOTSET",
                     "from ..models import *",
@@ -634,7 +682,9 @@ class ClientGenerator:
 
             # Кросс-импорты уже добавлены выше
 
-            zone_class = endpoints_file.add_class(zone.capitalize())
+            # Используем ту же логику очистки имен что и для схем
+            zone_class_name = self.schema_resolver._clean_schema_name(zone)
+            zone_class = endpoints_file.add_class(zone_class_name)
 
             zone_class.add_function(
                 "__init__",
@@ -1136,11 +1186,16 @@ class ClientGenerator:
                 # С from __future__ import annotations кавычки не нужны
                 return Variable(value=f'"{resolved_name}"')
             else:
-                # Fallback - используем title как есть
-                if dependencies is not None:
-                    dependencies.add(title)
-                # С from __future__ import annotations кавычки не нужны
-                return Variable(value=title)
+                # Inline enum - создаем Literal вместо dependency
+                if schema.get("enum"):
+                    enum_values = schema["enum"]
+                    literal_values = ", ".join(f"'{v}'" for v in enum_values)
+                    return Variable(value=f"Literal[{literal_values}]")
+                else:
+                    # Обычный title без enum
+                    if dependencies is not None:
+                        dependencies.add(title)
+                    return Variable(value=f'"{title}"')
 
         # anyOf/oneOf в поле модели
         if schema.get("anyOf") or schema.get("oneOf"):
@@ -1206,6 +1261,11 @@ class ClientGenerator:
                             types.append(Variable(value=item_type, wrap_name="List"))
                         else:
                             types.append(Variable(value="list"))
+                elif variant.get("enum") and variant.get("title"):
+                    # Inline enum в anyOf - создаем Literal напрямую
+                    enum_values = variant["enum"]
+                    literal_values = ", ".join(f"'{v}'" for v in enum_values)
+                    types.append(Variable(value=f"Literal[{literal_values}]"))
                 else:
                     types.append(
                         self._get_type_for_model_field(variant, zone, dependencies)
@@ -1487,6 +1547,10 @@ class ClientGenerator:
 
     def _get_clean_model_type(self, responses: Dict, zone: str) -> str:
         """Получение чистого типа модели для response_model без Optional оберток"""
+        # Если нет zone или zone = "common", ищем по первому найденному title
+        if not zone or zone == "common":
+            zone = None
+
         # Пытаемся использовать оригинальную спеку если она доступна
         # чтобы избежать проблем с jsonref который резолвит $ref
         for status_code, response_spec in responses.items():
@@ -1523,18 +1587,34 @@ class ClientGenerator:
                                             schema_clean_name = (
                                                 self._get_clean_schema_name(schema_name)
                                             )
-                                            # Проверяем зону
+                                            # Проверяем зону - очень гибкий поиск
                                             if zone:
-                                                zone_prefix = zone.capitalize()
-                                                expected_name = f"{zone_prefix}{title}"
-                                                if schema_clean_name == expected_name:
+                                                zone_lower = zone.lower()
+                                                schema_lower = schema_clean_name.lower()
+                                                title_lower = title.lower()
+
+                                                # Ищем модель содержащую зону (или её часть) и title
+                                                zone_match = (
+                                                    zone_lower in schema_lower
+                                                    or any(
+                                                        part in schema_lower
+                                                        for part in zone_lower.split(
+                                                            "_"
+                                                        )
+                                                        if len(part) > 2
+                                                    )
+                                                )
+                                                title_match = (
+                                                    title_lower in schema_lower
+                                                )
+
+                                                if zone_match and title_match:
                                                     return schema_clean_name
                                             else:
                                                 if schema_clean_name:
                                                     return schema_clean_name
-                                    # Fallback
-                                    clean_name = self._get_clean_schema_name(title)
-                                    return clean_name
+                                    # Простой fallback
+                                    return title
                         elif "$ref" in schema:
                             # Прямая ссылка на модель
                             ref_name = schema["$ref"].replace(
@@ -1574,9 +1654,20 @@ class ClientGenerator:
                                     )
                                     # Проверяем зону для всех схем
                                     if zone:
-                                        zone_prefix = zone.capitalize()
-                                        expected_name = f"{zone_prefix}{title}"
-                                        if schema_clean_name == expected_name:
+                                        # Используем гибкий поиск как в _get_return_type
+                                        zone_lower = zone.lower()
+                                        schema_lower = schema_clean_name.lower()
+                                        title_lower = title.lower()
+
+                                        # Ищем модель содержащую зону (или её часть) и title
+                                        zone_match = zone_lower in schema_lower or any(
+                                            part in schema_lower
+                                            for part in zone_lower.split("_")
+                                            if len(part) > 2
+                                        )
+                                        title_match = title_lower in schema_lower
+
+                                        if zone_match and title_match:
                                             return schema_clean_name
                                     else:
                                         # Если нет зоны, возвращаем первую найденную

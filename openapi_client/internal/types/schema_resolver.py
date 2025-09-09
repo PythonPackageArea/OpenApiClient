@@ -105,11 +105,62 @@ class SchemaNameResolver:
                 prefix_parts = [p for p in parts[0].split("__") if p]
                 suffix = parts[1].strip("__")
 
-                # Берем предпоследнюю значимую часть как зону
+                # Берем зону из правильной части
                 if len(prefix_parts) >= 2:
-                    zone = prefix_parts[-2].capitalize()
+                    # Ищем часть schemas и берем то что перед ней как зону
+                    zone_parts = []
+                    for i, part in enumerate(prefix_parts):
+                        if part.lower() == "schemas":
+                            # Берем части, которые представляют зону (обычно после services)
+                            # Ищем services и берем все что после него до schemas
+                            services_idx = -1
+                            for j, p in enumerate(prefix_parts):
+                                if p.lower() == "services":
+                                    services_idx = j
+                                    break
 
-                    # Создаем итоговое имя: Bots + Create = BotsCreate
+                            if services_idx >= 0 and services_idx < i - 1:
+                                # Берем все между services и schemas
+                                zone_parts = prefix_parts[services_idx + 1 : i]
+                            else:
+                                # Fallback - берем последние 2 части перед schemas
+                                if i >= 2:
+                                    zone_parts = prefix_parts[i - 2 : i]
+                                elif i >= 1:
+                                    zone_parts = prefix_parts[i - 1 : i]
+                            break
+
+                    if not zone_parts:
+                        # Fallback - берем предпоследнюю часть
+                        zone_parts = [prefix_parts[-2]]
+
+                    # Создаем зону из частей, капитализируя каждую часть
+                    if len(zone_parts) == 1:
+                        # Если в части есть underscores, обрабатываем их
+                        zone_part = zone_parts[0]
+                        if "_" in zone_part:
+                            # Разбиваем по underscores и капитализируем каждую часть
+                            sub_parts = []
+                            for sub_part in zone_part.split("_"):
+                                if sub_part:
+                                    sub_parts.append(sub_part.capitalize())
+                            zone = "".join(sub_parts)
+                        else:
+                            zone = zone_part.capitalize()
+                    else:
+                        # Капитализируем каждую часть и соединяем без разделителей
+                        zone_name_parts = []
+                        for part in zone_parts:
+                            if part and "_" in part:
+                                # Обрабатываем underscores в каждой части
+                                for sub_part in part.split("_"):
+                                    if sub_part:
+                                        zone_name_parts.append(sub_part.capitalize())
+                            elif part:
+                                zone_name_parts.append(part.capitalize())
+                        zone = "".join(zone_name_parts)
+
+                    # Создаем итоговое имя: SupportMessages + Create = SupportMessagesCreate
                     if suffix:
                         return f"{zone}{suffix}"
 
@@ -189,6 +240,7 @@ class SchemaNameResolver:
                 elif part.lower() == "id":
                     parts.append("ID")
                 else:
+                    # Капитализируем каждую часть отдельно
                     parts.append(part.capitalize())
             return "".join(parts)
 
