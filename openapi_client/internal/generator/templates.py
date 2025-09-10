@@ -227,7 +227,7 @@ class AiohttpClient:
                     request_kwargs = {
                         'method': method,
                         'url': full_url,
-                        'params': json.dumps(params) if params else None,
+                        'params': params,
                     }
 
                     # Добавление кастомных headers
@@ -238,14 +238,29 @@ class AiohttpClient:
                     if files:
                         form_data = aiohttp.FormData()
                         for field_name, file_data in files.items():
-                            form_data.add_field(
-                                field_name,
-                                file_data,
-                                filename=f'{field_name}.bin'
-                            )
+                            if isinstance(file_data, list):
+                                # Список файлов - добавляем каждый отдельно
+                                for i, single_file in enumerate(file_data):
+                                    form_data.add_field(
+                                        field_name,
+                                        single_file,
+                                        filename=f'{field_name}_{i}.bin'
+                                    )
+                            else:
+                                # Один файл
+                                form_data.add_field(
+                                    field_name,
+                                    file_data,
+                                    filename=f'{field_name}.bin'
+                                )
                         if data:
                             for key, value in data.items():
-                                form_data.add_field(key, str(value))
+                                if isinstance(value, list):
+                                    # Для списков добавляем каждый элемент отдельно
+                                    for item in value:
+                                        form_data.add_field(key, str(item))
+                                else:
+                                    form_data.add_field(key, str(value))
                         request_kwargs['data'] = form_data
                     else:
                         # Обработка JSON или form data
@@ -257,6 +272,9 @@ class AiohttpClient:
                                 request_kwargs['json'] = data
                         elif isinstance(data, str):
                             request_kwargs['data'] = data
+                        elif isinstance(data, (int, float, bool)) or data is None:
+                            # Примитивные типы и None отправляем как JSON
+                            request_kwargs['json'] = data
 
                     async with session.request(**request_kwargs) as response:
                         logger.debug(f"Response status: {response.status}")
@@ -500,6 +518,9 @@ def serialize_value(value: Any) -> Any:
         return value.isoformat()
     elif isinstance(value, date):
         return value.isoformat()
+    elif isinstance(value, bool):
+        # Boolean значения остаются boolean для body данных
+        return value
     elif isinstance(value, bytes):
         # Кодируем bytes в base64 для JSON
         import base64
@@ -515,13 +536,37 @@ def serialize_value(value: Any) -> Any:
         return value
 
 
+def serialize_query_value(value: Any) -> Any:
+    \"\"\"Специальная сериализация для query параметров\"\"\"
+    if isinstance(value, datetime):
+        return value.isoformat()
+    elif isinstance(value, date):
+        return value.isoformat()
+    elif isinstance(value, bool):
+        # Boolean значения для query параметров должны быть строками
+        return str(value).lower()
+    elif isinstance(value, bytes):
+        # Кодируем bytes в base64 для JSON
+        import base64
+        return base64.b64encode(value).decode('utf-8')
+    elif isinstance(value, dict):
+        return {k: serialize_query_value(v) for k, v in value.items()}
+    elif isinstance(value, (list, tuple)):
+        return [serialize_query_value(item) for item in value]
+    elif hasattr(value, 'model_dump'):
+        # Pydantic модель - используем model_dump с сериализацией
+        return serialize_query_value(value.model_dump())
+    else:
+        return value
+
+
 def prepare_params(locals_dict: dict) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка query параметров\"\"\"
     params = {}
     for k, v in locals_dict.items():
         if k.endswith('_query') and not is_not_set(v):
-            # Сериализуем query параметры (особенно важно для дат)
-            params[k[:-6]] = serialize_value(v)
+            # Сериализуем query параметры (особенно важно для дат и boolean)
+            params[k[:-6]] = serialize_query_value(v)
     return params if params else None
 
 
@@ -566,13 +611,11 @@ def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=N
     if len(other_body_fields) == 1 and not additional_fields:
         single_field_name, single_field_value = next(iter(other_body_fields.items()))
         
-        # Если это поле называется как типичные "целые body" имена
-        # или если это сложный объект (Pydantic модель), передаем как весь body
-        whole_body_names = ['data', 'model', 'request', 'body', 'item', 'payload']
-        
-        if (single_field_name in whole_body_names or
-            (hasattr(single_field_value, 'keys') and isinstance(single_field_value, dict) and 
-             len(single_field_value) > 1)):  # Сложный объект с несколькими полями
+        # Автоматически передаем как весь body только для очень простых случаев:
+        # - Поле называется 'request_body' (создается для $ref на корневом уровне)
+        # - Поле содержит простое значение (не dict с несколькими полями)
+        if (single_field_name == 'request_body' or
+            (single_field_name in ['new_data'] and not isinstance(single_field_value, dict))):
             return single_field_value
     
     # Иначе собираем body из отдельных полей
@@ -583,13 +626,28 @@ def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=N
 
 
 def prepare_files(locals_dict: dict) -> Optional[Dict[str, Any]]:
-    \"\"\"Подготовка file параметров\"\"\"
-    files = {
-        k[:-5]: v 
-        for k, v in locals_dict.items() 
-        if k.endswith('_file') and not is_not_set(v)
-    }
+    \"\"\"Подготовка file параметров (bytes и List[bytes])\"\"\"
+    files = {}
+    for k, v in locals_dict.items():
+        if k.endswith('_file') and not is_not_set(v):
+            # bytes или список bytes считаются файлами
+            if isinstance(v, bytes):
+                files[k[:-5]] = v
+            elif isinstance(v, list) and v and isinstance(v[0], bytes):
+                # Список bytes файлов
+                files[k[:-5]] = v
     return files if files else None
+
+
+def prepare_form_data(locals_dict: dict) -> Optional[Dict[str, Any]]:
+    \"\"\"Подготовка form данных (не файлы)\"\"\"
+    form_data = {}
+    for k, v in locals_dict.items():
+        if k.endswith('_file') and not is_not_set(v):
+            # Исключаем bytes и List[bytes] - это файлы
+            if not isinstance(v, bytes) and not (isinstance(v, list) and v and isinstance(v[0], bytes)):
+                form_data[k[:-5]] = serialize_value(v)
+    return form_data if form_data else None
 
 
 async def handle_request(client, method: str, path: str, locals_dict: dict, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None) -> Any:
@@ -597,6 +655,19 @@ async def handle_request(client, method: str, path: str, locals_dict: dict, resp
     params = prepare_params(locals_dict)
     data = prepare_body_data(locals_dict, whole_body_fields, field_mapping)
     files = prepare_files(locals_dict)
+    form_data = prepare_form_data(locals_dict)
+    
+    # Объединяем form_data с data для multipart запросов
+    if form_data:
+        if data:
+            # Если есть и body data и form data, объединяем
+            if isinstance(data, dict):
+                data.update(form_data)
+            else:
+                # Если data не dict, создаем новый dict
+                data = form_data
+        else:
+            data = form_data
     
     response = await client._send_request(
         method=method,

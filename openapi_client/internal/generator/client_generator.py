@@ -244,8 +244,12 @@ class ClientGenerator:
             # Для Union типов передаем список моделей
             models_str = "[" + ", ".join(response_models_list) + "]"
             decorator_args.append(f"response_models={models_str}")
-        elif clean_model_type != "Any":
-            # Для обычных типов используем response_model
+        elif (
+            clean_model_type != "Any"
+            and clean_model_type not in ["dict", "list"]
+            and not clean_model_type.startswith("Dict[")
+        ):
+            # Для обычных типов используем response_model, но не для generic типов (dict, list, Dict[])
             decorator_args.append(f"response_model={clean_model_type}")
 
         if whole_body_fields:
@@ -568,6 +572,34 @@ class ClientGenerator:
                     )
                     continue
 
+                # Обработка простых типов (string, integer, boolean и т.д.)
+                schema_type = schema.get("type")
+                if schema_type in [
+                    "string",
+                    "integer",
+                    "number",
+                    "boolean",
+                ] and not schema.get("properties"):
+                    # Это простой тип данных для body
+                    title = schema.get("title", "new_data")
+                    clean_title = self._clean_parameter_name(title)
+                    snake_case_title = self._snake_case(clean_title)
+                    param_name = snake_case_title + "_body"
+
+                    # Получаем тип данных
+                    var_type = self._get_type(schema, zone)
+                    default = None if is_required else Variable(value="NOTSET")
+
+                    parameters.append(
+                        Parameter(
+                            name=param_name,
+                            var_type=var_type,
+                            default=default,
+                            is_whole_body=True,
+                        )
+                    )
+                    continue
+
                 # Обработка properties
                 properties = schema.get("properties", {})
 
@@ -865,8 +897,13 @@ class ClientGenerator:
                                 "properties"
                             ):
                                 additional_props = schema["additionalProperties"]
-                                value_type = self._get_type(additional_props, zone)
-                                success_responses.append(f"Dict[str, {value_type}]")
+                                if additional_props is True:
+                                    # additionalProperties: true означает Dict[str, Any]
+                                    success_responses.append("Dict[str, Any]")
+                                else:
+                                    # additionalProperties с конкретной схемой типа
+                                    value_type = self._get_type(additional_props, zone)
+                                    success_responses.append(f"Dict[str, {value_type}]")
                             else:
                                 # Инлайн объект с title - используем зарегистрированную схему
                                 title = schema["title"]
@@ -2398,14 +2435,31 @@ class ClientGenerator:
                 whole_body_fields.append("data")
                 continue
 
-            # Если это anyOf/oneOf - тоже Union типы, data должно быть целым
+            # Если это anyOf/oneOf - тоже Union типы, должны передаваться целиком
             if schema.get("anyOf") or schema.get("oneOf"):
-                whole_body_fields.append("data")
+                title = schema.get("title", "data")
+                clean_title = self._clean_parameter_name(title)
+                snake_case_title = self._snake_case(clean_title)
+                whole_body_fields.append(snake_case_title)
                 continue
 
             # Если это array - массив должен передаваться целиком
             if schema.get("type") == "array":
                 title = schema.get("title", "models")
+                clean_title = self._clean_parameter_name(title)
+                snake_case_title = self._snake_case(clean_title)
+                whole_body_fields.append(snake_case_title)
+                continue
+
+            # Если это простой тип (string, integer, boolean) - должен передаваться целиком как body
+            schema_type = schema.get("type")
+            if schema_type in [
+                "string",
+                "integer",
+                "number",
+                "boolean",
+            ] and not schema.get("properties"):
+                title = schema.get("title", "new_data")
                 clean_title = self._clean_parameter_name(title)
                 snake_case_title = self._snake_case(clean_title)
                 whole_body_fields.append(snake_case_title)
@@ -2422,13 +2476,9 @@ class ClientGenerator:
 
                     # Если свойство ссылается на модель
                     if "$ref" in prop_schema:
-                        # Проверяем, не создается ли для этого поля отдельный параметр _body
-                        # Если создается параметр {clean_prop_name}_body, то не включаем в whole_body_fields
-                        # Это поле должно передаваться целиком только если оно единственное или особое
-                        if len(properties) == 1:
-                            # Если это единственное свойство, передаем как whole_body
-                            whole_body_fields.append(prop_name)
-                        # Если свойств несколько, каждое будет отдельным параметром _body
+                        # Для $ref свойств НЕ добавляем в whole_body_fields
+                        # Они должны передаваться как поля объекта, а не как весь body
+                        # Исключение: если это действительно простая обертка (будет обработано ниже)
                         continue
                     # Если это anyOf/oneOf в свойстве - проверяем что это не просто Optional
                     elif prop_schema.get("anyOf") or prop_schema.get("oneOf"):
@@ -2448,18 +2498,17 @@ class ClientGenerator:
                             )
                         )
                         if has_model_ref or not is_simple_optional:
-                            # Аналогично проверяем - если свойств несколько, каждое будет параметром
-                            if len(properties) == 1:
-                                whole_body_fields.append(prop_name)
+                            # Для сложных anyOf/oneOf НЕ добавляем в whole_body_fields
+                            # Они должны передаваться как поля объекта
                             continue
                     # Если это сложный объект без $ref, но с несколькими свойствами
                     elif (
                         prop_schema.get("type") == "object"
                         and len(prop_schema.get("properties", {})) > 1
                     ):
-                        # Аналогично проверяем - если свойств несколько, каждое будет параметром
-                        if len(properties) == 1:
-                            whole_body_fields.append(prop_name)
+                        # Для сложных объектов НЕ добавляем в whole_body_fields
+                        # Они должны передаваться как поля объекта
+                        continue
 
         return whole_body_fields
 
@@ -2482,14 +2531,32 @@ class ClientGenerator:
                     model_schema = schemas[ref_name]
                     properties = model_schema.get("properties", {})
 
+                    # Воспроизводим логику дедупликации из _create_body_parameters
+                    used_param_names = set()
+
                     for original_name, prop_schema in properties.items():
                         # Очищаем имя параметра так же как делает генератор
                         clean_name = self._clean_parameter_name(original_name)
-                        snake_case_name = self._snake_case(clean_name)
 
-                        # Если очищенное имя отличается от оригинального
-                        if snake_case_name != original_name:
-                            field_mapping[snake_case_name] = original_name
+                        if content_type == "multipart/form-data":
+                            param_name = f"{clean_name}_file"
+                        else:
+                            param_name = f"{clean_name}_body"
+
+                        # Дедупликация имен (та же логика что в _create_body_parameters)
+                        original_param_name = param_name
+                        counter = 1
+                        while param_name in used_param_names:
+                            param_name = f"{original_param_name}_{counter}"
+                            counter += 1
+                        used_param_names.add(param_name)
+
+                        # Создаем маппинг: имя_параметра_без_суффикса -> оригинальное_имя_поля
+                        if content_type == "multipart/form-data":
+                            field_name = param_name[:-5]  # убираем _file
+                        else:
+                            field_name = param_name[:-5]  # убираем _body
+                        field_mapping[field_name] = original_name
 
             # Если это object со свойствами напрямую
             elif schema.get("type") == "object":
