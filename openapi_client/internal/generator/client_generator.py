@@ -204,9 +204,17 @@ class ClientGenerator:
 
         # Body параметры
         request_body = spec.get("requestBody", {})
+        whole_body_fields = []
+        field_mapping = {}
         if request_body:
             body_params = self._create_body_parameters(request_body, zone)
             parameters.extend(body_params)
+
+            # Определяем какие поля должны передаваться целиком
+            whole_body_fields = self._determine_whole_body_fields(request_body, zone)
+
+            # Создаем маппинг полей для сложных имен
+            field_mapping = self._create_field_mapping(request_body, zone)
 
         # Тип возврата
         return_type = self._get_return_type(spec.get("responses", {}), zone)
@@ -214,15 +222,48 @@ class ClientGenerator:
         # Получаем чистое имя модели для декоратора
         clean_model_type = self._get_clean_model_type(spec.get("responses", {}), zone)
 
+        # Получаем список моделей для Union типов
+        response_models_list = self._get_response_models_list(
+            spec.get("responses", {}), zone
+        )
+
         # Если return_type = "Any", но у нас есть конкретная модель, используем её
+        # Но для массивов сохраняем List[] обертку из _get_return_type
         if return_type == "Any" and clean_model_type != "Any":
-            return_type = clean_model_type
+            # Проверяем, не является ли это массивом модели
+            is_array_response = self._is_array_response(spec.get("responses", {}))
+            if is_array_response:
+                return_type = f"List[{clean_model_type}]"
+            else:
+                return_type = clean_model_type
 
         # Создаем декоратор
-        if clean_model_type != "Any":
-            decorator = f"@{method}('{path}', response_model={clean_model_type})"
-        else:
-            decorator = f"@{method}('{path}')"
+        decorator_args = [f"'{path}'"]
+
+        if response_models_list:
+            # Для Union типов передаем список моделей
+            models_str = "[" + ", ".join(response_models_list) + "]"
+            decorator_args.append(f"response_models={models_str}")
+        elif clean_model_type != "Any":
+            # Для обычных типов используем response_model
+            decorator_args.append(f"response_model={clean_model_type}")
+
+        if whole_body_fields:
+            # Добавляем whole_body_fields если есть
+            fields_str = (
+                "[" + ", ".join(f"'{field}'" for field in whole_body_fields) + "]"
+            )
+            decorator_args.append(f"whole_body_fields={fields_str}")
+
+        if field_mapping:
+            # Добавляем field_mapping если есть
+            mapping_items = []
+            for param_name, original_name in field_mapping.items():
+                mapping_items.append(f"'{param_name}': '{original_name}'")
+            mapping_str = "{" + ", ".join(mapping_items) + "}"
+            decorator_args.append(f"field_mapping={mapping_str}")
+
+        decorator = f"@{method}({', '.join(decorator_args)})"
 
         # Создаем функцию с декоратором
         func = zone_class.add_function(
@@ -328,12 +369,15 @@ class ClientGenerator:
             is_path_param = True
         # Убираем автоматическое превращение query в path - это было неправильно
 
+        # Очищаем имя параметра
+        clean_name = self._clean_parameter_name(name)
+
         if is_path_param:
-            param_name = f"{name}_path"
+            param_name = f"{clean_name}_path"
         elif param_type == "query":
-            param_name = f"{name}_query"
+            param_name = f"{clean_name}_query"
         else:
-            param_name = name
+            param_name = clean_name
 
         var_type = self._get_type(param_spec.get("schema", {}), "")
 
@@ -349,6 +393,8 @@ class ClientGenerator:
         """Создание body параметров с поддержкой моделей"""
         parameters = []
         content = request_body.get("content", {})
+        used_param_names = set()  # Для дедупликации имен
+        is_required = request_body.get("required", False)
 
         for content_type, content_spec in content.items():
             schema = content_spec.get("schema", {})
@@ -359,28 +405,227 @@ class ClientGenerator:
                 # Для body параметров используем правильное разрешение с учетом зоны
                 resolved_name = self.schema_resolver.resolve_schema_name(ref_name, zone)
                 param_name = "request_body"
-                var_type = Variable(value=f'"{resolved_name}"')
-                default = Variable(value="NOTSET")
+                var_type = Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
+                default = None if is_required else Variable(value="NOTSET")
 
                 parameters.append(
-                    Parameter(name=param_name, var_type=var_type, default=default)
+                    Parameter(
+                        name=param_name,
+                        var_type=var_type,
+                        default=default,
+                        is_whole_body=True,
+                    )
+                )
+
+                # Проверяем, имеет ли ссылочная модель additionalProperties
+                schemas = self.openapi_dict.get("components", {}).get("schemas", {})
+                if ref_name in schemas:
+                    ref_schema = schemas[ref_name]
+                    if ref_schema.get("additionalProperties") is True:
+                        # Добавляем параметр для дополнительных полей
+                        additional_param_name = "additional_fields_body"
+
+                        # Дедупликация имен
+                        original_param_name = additional_param_name
+                        counter = 1
+                        while additional_param_name in used_param_names:
+                            additional_param_name = f"{original_param_name}_{counter}"
+                            counter += 1
+                        used_param_names.add(additional_param_name)
+
+                        var_type = Variable(value="Dict[str, Any]")
+                        default = Variable(
+                            value="NOTSET"
+                        )  # additional_fields всегда опциональные
+
+                        parameters.append(
+                            Parameter(
+                                name=additional_param_name,
+                                var_type=var_type,
+                                default=default,
+                            )
+                        )
+            elif schema.get("anyOf") or schema.get("oneOf"):
+                # Обработка anyOf/oneOf структур для body параметров
+                variants = schema.get("anyOf", []) + schema.get("oneOf", [])
+
+                # Создаем Union тип из всех вариантов
+                union_types = []
+                for variant in variants:
+                    if "$ref" in variant:
+                        ref_name = variant["$ref"].replace("#/components/schemas/", "")
+                        clean_name = self._get_clean_schema_name(ref_name)
+                        union_types.append(f'"{clean_name}"')
+                    elif variant.get("type") == "object" and "title" in variant:
+                        # Развернутая схема с title - ищем по title
+                        title = variant["title"]
+                        # Пытаемся найти схему по title
+                        schemas = self.openapi_dict.get("components", {}).get(
+                            "schemas", {}
+                        )
+                        found_ref = None
+                        for schema_name, schema_spec in schemas.items():
+                            if schema_spec.get("title") == title:
+                                found_ref = schema_name
+                                break
+
+                        if found_ref:
+                            clean_name = self._get_clean_schema_name(found_ref)
+                            union_types.append(f'"{clean_name}"')
+                        else:
+                            # Fallback - используем title как есть
+                            clean_title = self._clean_parameter_name(title)
+                            clean_name = self._pascal_case(clean_title)
+                            union_types.append(f'"{clean_name}"')
+                    else:
+                        # Примитивные типы
+                        var_type = self._get_type(variant, zone)
+                        union_types.append(str(var_type))
+
+                # Создаем параметр с Union типом
+                title = schema.get("title", "data")
+                clean_title = self._clean_parameter_name(title)
+                snake_case_title = self._snake_case(clean_title)
+                param_name = snake_case_title + "_body"
+                if len(union_types) > 1:
+                    var_type = Variable(value=union_types, wrap_name="Union")
+                else:
+                    var_type = Variable(value=union_types[0] if union_types else "Any")
+
+                default = None if is_required else Variable(value="NOTSET")
+
+                parameters.append(
+                    Parameter(
+                        name=param_name,
+                        var_type=var_type,
+                        default=default,
+                        is_whole_body=True,
+                    )
                 )
             else:
+                # Обработка properties (только если это не array)
+                if schema.get("type") == "array":
+                    # Это массив без $ref - обрабатываем отдельно
+                    items_schema = schema.get("items", {})
+
+                    # Определяем тип элементов массива
+                    if "$ref" in items_schema:
+                        ref_name = items_schema["$ref"].replace(
+                            "#/components/schemas/", ""
+                        )
+                        clean_name = self._get_clean_schema_name(ref_name)
+                        item_type = f'"{clean_name}"'
+                    elif (
+                        items_schema.get("type") == "object" and "title" in items_schema
+                    ):
+                        # Развернутая схема с title - нужно найти правильное имя схемы
+                        title = items_schema["title"]
+                        # Ищем схему по title в components/schemas
+                        schemas = self.openapi_dict.get("components", {}).get(
+                            "schemas", {}
+                        )
+                        found_schema_name = None
+                        for schema_name, schema_spec in schemas.items():
+                            if schema_spec.get("title") == title:
+                                found_schema_name = schema_name
+                                break
+
+                        if found_schema_name:
+                            clean_name = self._get_clean_schema_name(found_schema_name)
+                            item_type = f'"{clean_name}"'
+                        else:
+                            # Fallback - используем title
+                            clean_name = self._get_clean_schema_name(title)
+                            item_type = f'"{clean_name}"'
+                    else:
+                        # Для примитивных типов или сложных схем
+                        type_var = self._get_type(items_schema, zone)
+                        # Если это Variable с value, используем его, иначе str
+                        if hasattr(type_var, "value"):
+                            if isinstance(type_var.value, str):
+                                item_type = type_var.value
+                            else:
+                                item_type = str(type_var)
+                        else:
+                            item_type = str(type_var)
+
+                    # Создаем параметр для массива
+                    title = schema.get("title", "models")
+                    clean_title = self._clean_parameter_name(title)
+                    snake_case_title = self._snake_case(clean_title)
+                    param_name = snake_case_title + "_body"
+
+                    var_type = Variable(value=[item_type], wrap_name="List")
+                    default = None if is_required else Variable(value="NOTSET")
+
+                    parameters.append(
+                        Parameter(
+                            name=param_name,
+                            var_type=var_type,
+                            default=default,
+                            is_whole_body=True,
+                        )
+                    )
+                    continue
+
                 # Обработка properties
                 properties = schema.get("properties", {})
 
+                # Получаем список обязательных полей
+                required_fields = schema.get("required", [])
+
                 for prop_name, prop_spec in properties.items():
+                    # Очищаем имя параметра
+                    clean_prop_name = self._clean_parameter_name(prop_name)
+
                     if content_type == "multipart/form-data":
-                        param_name = f"{prop_name}_file"
+                        param_name = f"{clean_prop_name}_file"
                     else:
-                        param_name = f"{prop_name}_body"
+                        param_name = f"{clean_prop_name}_body"
+
+                    # Дедупликация имен
+                    original_param_name = param_name
+                    counter = 1
+                    while param_name in used_param_names:
+                        param_name = f"{original_param_name}_{counter}"
+                        counter += 1
+                    used_param_names.add(param_name)
 
                     # Для body параметров используем правильное разрешение типов с зоной
                     var_type = self._get_type_for_model_field(prop_spec, zone)
-                    default = Variable(value="NOTSET")
+
+                    # Устанавливаем default в зависимости от required флагов
+                    field_is_required = is_required and prop_name in required_fields
+                    default = None if field_is_required else Variable(value="NOTSET")
 
                     parameters.append(
                         Parameter(name=param_name, var_type=var_type, default=default)
+                    )
+
+                # Проверяем additionalProperties для поддержки дополнительных полей
+                if schema.get("additionalProperties") is True:
+                    # Добавляем параметр для дополнительных полей
+                    additional_param_name = "additional_fields_body"
+
+                    # Дедупликация имен
+                    original_param_name = additional_param_name
+                    counter = 1
+                    while additional_param_name in used_param_names:
+                        additional_param_name = f"{original_param_name}_{counter}"
+                        counter += 1
+                    used_param_names.add(additional_param_name)
+
+                    var_type = Variable(value="Dict[str, Any]")
+                    default = Variable(
+                        value="NOTSET"
+                    )  # additional_fields всегда опциональные
+
+                    parameters.append(
+                        Parameter(
+                            name=additional_param_name,
+                            var_type=var_type,
+                            default=default,
+                        )
                     )
 
         return parameters
@@ -412,6 +657,14 @@ class ClientGenerator:
 
     def _get_type(self, schema: Dict, zone: str = "") -> Variable:
         """Получение типа из схемы"""
+        # Проверяем что schema это словарь
+        if not isinstance(schema, dict):
+            # Если schema это bool или другой примитивный тип
+            if isinstance(schema, bool):
+                return Variable(value="bool")
+            else:
+                return Variable(value="Any")
+
         if "$ref" in schema:
             ref_name = schema["$ref"].replace("#/components/schemas/", "")
             clean_name = self.schema_resolver.resolve_schema_name(ref_name, zone)
@@ -528,7 +781,11 @@ class ClientGenerator:
                                             found = True
                                             break
                                     if not found:
-                                        clean_name = self._get_clean_schema_name(title)
+                                        # Ищем схему по title и используем её полное имя
+                                        full_name = self._find_schema_by_title(title)
+                                        clean_name = self._get_clean_schema_name(
+                                            full_name
+                                        )
                                         type_variants.append(clean_name)
                                 else:
                                     var_type = self._get_type(variant, zone)
@@ -565,12 +822,48 @@ class ClientGenerator:
                                 )
                                 clean_name = self._get_clean_schema_name(ref_name)
                                 success_responses.append(f"List[{clean_name}]")
+                            elif items.get("type") == "object" and "title" in items:
+                                # Развернутая схема с title после jsonref
+                                title = items["title"]
+                                # Ищем схему по title, приоритизируем Output для responses
+                                schemas = self.openapi_dict.get("components", {}).get(
+                                    "schemas", {}
+                                )
+                                found_schema_name = None
+                                output_schema_name = None
+
+                                for schema_name, schema_spec in schemas.items():
+                                    if schema_spec.get("title") == title:
+                                        if (
+                                            "Output" in schema_name
+                                            or "output" in schema_name
+                                        ):
+                                            output_schema_name = schema_name
+                                        elif found_schema_name is None:
+                                            found_schema_name = schema_name
+
+                                # Предпочитаем Output модель если есть
+                                final_schema_name = (
+                                    output_schema_name or found_schema_name
+                                )
+                                found_schema = False
+                                if final_schema_name:
+                                    clean_name = self._get_clean_schema_name(
+                                        final_schema_name
+                                    )
+                                    success_responses.append(f"List[{clean_name}]")
+                                    found_schema = True
+                                if not found_schema:
+                                    # Fallback к dict если схема не найдена
+                                    success_responses.append("List[dict]")
                             else:
                                 var_type = self._get_type(schema, zone)
                                 success_responses.append(str(var_type))
                         elif schema.get("type") == "object" and "title" in schema:
-                            # Проверяем additionalProperties - это должно быть Dict, а не модель
-                            if "additionalProperties" in schema:
+                            # Проверяем additionalProperties - это должно быть Dict только если нет properties
+                            if "additionalProperties" in schema and not schema.get(
+                                "properties"
+                            ):
                                 additional_props = schema["additionalProperties"]
                                 value_type = self._get_type(additional_props, zone)
                                 success_responses.append(f"Dict[str, {value_type}]")
@@ -618,8 +911,9 @@ class ClientGenerator:
                                             break
 
                                 if not found_schema:
-                                    # Fallback - используем title как есть
-                                    clean_name = self._get_clean_schema_name(title)
+                                    # Fallback - ищем схему по title и используем её полное имя
+                                    full_name = self._find_schema_by_title(title)
+                                    clean_name = self._get_clean_schema_name(full_name)
                                     success_responses.append(clean_name)
                         else:
                             var_type = self._get_type(schema, zone)
@@ -674,7 +968,7 @@ class ClientGenerator:
                     "from ..decorators import get, post, put, delete, patch",
                     "from ..common import AiohttpClient",
                     "from typing import Optional, List, Any, Union, Literal, Dict",
-                    "from datetime import datetime",
+                    "from datetime import datetime, date",
                     "from ..constants import NOTSET",
                     "from ..models import *",
                 ]
@@ -737,9 +1031,11 @@ class ClientGenerator:
             # Enum модель
             model_class = model_file.add_class(clean_name, inherits=["str", "Enum"])
             for enum_value in schema_spec["enum"]:
+                # Генерируем валидное имя атрибута Python
+                attr_name = self._clean_enum_attribute_name(str(enum_value))
                 model_class.parameters.append(
                     Parameter(
-                        name=str(enum_value).upper(),
+                        name=attr_name,
                         default=Variable(value=repr(enum_value)),
                     )
                 )
@@ -783,9 +1079,46 @@ class ClientGenerator:
                 else:
                     default = None
 
-                model_class.parameters.append(
-                    Parameter(name=field_name, var_type=field_type, default=default)
+                # Очищаем имя поля для использования в Python
+                clean_field_name = self._clean_parameter_name(field_name)
+
+                # Если имя изменилось, используем Field с alias
+                if clean_field_name != field_name:
+                    if default:
+                        field_annotation = f"{field_type} = Field(default={default}, alias='{field_name}')"
+                    else:
+                        field_annotation = f"{field_type} = Field(alias='{field_name}')"
+
+                    model_class.parameters.append(
+                        Parameter(
+                            name=clean_field_name,
+                            var_type=Variable(value=field_annotation),
+                            default=None,
+                        )
+                    )
+                else:
+                    model_class.parameters.append(
+                        Parameter(
+                            name=clean_field_name, var_type=field_type, default=default
+                        )
+                    )
+
+            # Добавляем поддержку additionalProperties
+            if schema_spec.get("additionalProperties") is True:
+                # Добавляем model_config для поддержки дополнительных полей
+                model_class.add_code_block(
+                    CodeBlock(code="model_config = ConfigDict(extra='allow')", order=1)
                 )
+                # Добавляем импорт ConfigDict
+                if "from pydantic import ConfigDict" not in model_file.imports:
+                    # Найдем строку с импортом pydantic и дополним ее
+                    for i, imp in enumerate(model_file.imports):
+                        if imp.startswith("from pydantic import"):
+                            model_file.imports[i] = imp.replace(
+                                "from pydantic import BaseModel, Field",
+                                "from pydantic import BaseModel, Field, ConfigDict",
+                            )
+                            break
 
     def _generate_model(
         self, original_name: str, clean_name: str, schema_spec: Dict, filename: str
@@ -794,15 +1127,15 @@ class ClientGenerator:
         # Создаем отдельный файл для каждой модели
         model_file = self.project.add_file(f"models/{filename}.py")
 
-        # Базовые импорты
+        # Базовые импорты - всегда включаем datetime и date
         model_file.imports.extend(
             [
                 "from __future__ import annotations",
                 "",
-                "from pydantic import BaseModel",
+                "from pydantic import BaseModel, Field",
                 "from enum import Enum",
                 "from typing import Optional, Union, List, Dict, Literal, Any, TYPE_CHECKING",
-                "from datetime import datetime",
+                "from datetime import datetime, date",
             ]
         )
 
@@ -810,9 +1143,11 @@ class ClientGenerator:
             # Enum модель
             model_class = model_file.add_class(clean_name, inherits=["str", "Enum"])
             for enum_value in schema_spec["enum"]:
+                # Генерируем валидное имя атрибута Python
+                attr_name = self._clean_enum_attribute_name(str(enum_value))
                 model_class.parameters.append(
                     Parameter(
-                        name=str(enum_value).upper(),
+                        name=attr_name,
                         default=Variable(value=repr(enum_value)),
                     )
                 )
@@ -859,9 +1194,46 @@ class ClientGenerator:
                 else:
                     default = None
 
-                model_class.parameters.append(
-                    Parameter(name=field_name, var_type=field_type, default=default)
+                # Очищаем имя поля для использования в Python
+                clean_field_name = self._clean_parameter_name(field_name)
+
+                # Если имя изменилось, используем Field с alias
+                if clean_field_name != field_name:
+                    if default:
+                        field_annotation = f"{field_type} = Field(default={default}, alias='{field_name}')"
+                    else:
+                        field_annotation = f"{field_type} = Field(alias='{field_name}')"
+
+                    model_class.parameters.append(
+                        Parameter(
+                            name=clean_field_name,
+                            var_type=Variable(value=field_annotation),
+                            default=None,
+                        )
+                    )
+                else:
+                    model_class.parameters.append(
+                        Parameter(
+                            name=clean_field_name, var_type=field_type, default=default
+                        )
+                    )
+
+            # Добавляем поддержку additionalProperties
+            if schema_spec.get("additionalProperties") is True:
+                # Добавляем model_config для поддержки дополнительных полей
+                model_class.add_code_block(
+                    CodeBlock(code="model_config = ConfigDict(extra='allow')", order=1)
                 )
+                # Добавляем импорт ConfigDict
+                if "from pydantic import ConfigDict" not in model_file.imports:
+                    # Найдем строку с импортом pydantic и дополним ее
+                    for i, imp in enumerate(model_file.imports):
+                        if imp.startswith("from pydantic import"):
+                            model_file.imports[i] = imp.replace(
+                                "from pydantic import BaseModel, Field",
+                                "from pydantic import BaseModel, Field, ConfigDict",
+                            )
+                            break
 
             # Добавляем импорты зависимостей под TYPE_CHECKING
             type_checking_imports = []
@@ -901,6 +1273,117 @@ class ClientGenerator:
     def _get_clean_schema_name(self, schema_name: str) -> str:
         """Получение чистого имени схемы"""
         return self.schema_resolver._clean_schema_name(schema_name)
+
+    def _clean_parameter_name(self, name: str) -> str:
+        """Очистка имени параметра для использования в Python"""
+        # Заменяем дефисы на подчеркивания
+        name = name.replace("-", "_")
+        # Заменяем точки на подчеркивания
+        name = name.replace(".", "_")
+        # Заменяем скобки на подчеркивания
+        name = name.replace("[", "_").replace("]", "_")
+        # Заменяем спецсимволы на подчеркивания
+        name = "".join(c if c.isalnum() or c == "_" else "_" for c in name)
+        # Убираем множественные подчеркивания
+        while "__" in name:
+            name = name.replace("__", "_")
+        # Убираем подчеркивания в начале и конце
+        name = name.strip("_")
+        # Если имя начинается с цифры, добавляем префикс
+        if name and name[0].isdigit():
+            name = f"param_{name}"
+        # Если имя пустое, используем fallback
+        if not name:
+            name = "param"
+
+        # Проверяем зарезервированные слова Python
+        python_keywords = {
+            "and",
+            "as",
+            "assert",
+            "break",
+            "class",
+            "continue",
+            "def",
+            "del",
+            "elif",
+            "else",
+            "except",
+            "exec",
+            "finally",
+            "for",
+            "from",
+            "global",
+            "if",
+            "import",
+            "in",
+            "is",
+            "lambda",
+            "not",
+            "or",
+            "pass",
+            "print",
+            "raise",
+            "return",
+            "try",
+            "while",
+            "with",
+            "yield",
+            "True",
+            "False",
+            "None",
+            "async",
+            "await",
+            "nonlocal",
+        }
+
+        if name in python_keywords:
+            name = f"{name}_field"
+
+        return name
+
+    def _clean_enum_attribute_name(self, value: str) -> str:
+        """Очистка значения enum для использования как имя атрибута Python"""
+        # Если значение пустое, используем fallback
+        if not value:
+            return "EMPTY"
+
+        # Если только пробелы, используем fallback
+        if value.isspace():
+            return "SPACE"
+
+        # Заменяем дефисы и спецсимволы на подчеркивания
+        name = "".join(c.upper() if c.isalnum() else "_" for c in value)
+
+        # Убираем множественные подчеркивания
+        while "__" in name:
+            name = name.replace("__", "_")
+
+        # Убираем подчеркивания в начале и конце
+        name = name.strip("_")
+
+        # Если имя начинается с цифры, добавляем префикс
+        if name and name[0].isdigit():
+            name = f"VALUE_{name}"
+
+        # Если имя пустое после очистки, используем fallback
+        if not name:
+            return "VALUE"
+
+        # Ограничиваем длину имени
+        if len(name) > 50:
+            name = name[:47] + "_LONG"
+
+        return name
+
+    def _find_schema_by_title(self, title: str) -> str:
+        """Поиск полного имени схемы по title"""
+        for schema_name, schema_spec in (
+            self.openapi_dict.get("components", {}).get("schemas", {}).items()
+        ):
+            if schema_spec.get("title") == title:
+                return schema_name
+        return title
 
     def _finalize_structure(self):
         """Финализация структуры проекта"""
@@ -959,7 +1442,8 @@ class ClientGenerator:
         zone_assignments = []
 
         for zone_name in self.zones.keys():
-            zone_class = zone_name.capitalize()
+            # Используем ту же логику очистки имен что и для классов эндпоинтов
+            zone_class = self.schema_resolver._clean_schema_name(zone_name)
 
             # TYPE_CHECKING импорты (без отступов - они добавятся в шаблоне)
             zone_imports.append(
@@ -997,7 +1481,8 @@ class ClientGenerator:
                 # Добавляем runtime импорты зон
                 file.imports = []
                 for zone_name in self.zones.keys():
-                    zone_class = zone_name.capitalize()
+                    # Используем ту же логику очистки имен
+                    zone_class = self.schema_resolver._clean_schema_name(zone_name)
                     file.imports.append(
                         f"from .endpoints.{zone_name.lower()} import {zone_class}"
                     )
@@ -1049,6 +1534,14 @@ class ClientGenerator:
         if not schema:
             return Variable(value="Any")
 
+        # Проверяем что schema это словарь
+        if not isinstance(schema, dict):
+            # Если schema это bool или другой примитивный тип
+            if isinstance(schema, bool):
+                return Variable(value="bool")
+            else:
+                return Variable(value="Any")
+
         # $ref ссылки - правильно разрешаем в контексте зоны
         if "$ref" in schema:
             ref_name = schema["$ref"].replace("#/components/schemas/", "")
@@ -1067,12 +1560,9 @@ class ClientGenerator:
                     value_type = self._get_type(additional_props, zone)
                     return Variable(value=f"str, {value_type}", wrap_name="Dict")
 
-            resolved_name = self.schema_resolver.resolve_schema_name(
-                ref_name,
-                zone,
-            )
-            # С from __future__ import annotations кавычки не нужны
-            return Variable(value=f'"{resolved_name}"')
+            # Для forward references используем чистое имя класса
+            clean_name = self._get_clean_schema_name(ref_name)
+            return Variable(value=f'"{clean_name}"')
 
         schema_type = schema.get("type", "string")
         format_type = schema.get("format")
@@ -1131,7 +1621,9 @@ class ClientGenerator:
                             ref_name,
                             zone,
                         )
-                        types.append(Variable(value=f'"{resolved_name}"'))
+                        types.append(
+                            Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
+                        )
                     else:
                         # Fallback для незарегистрированных схем
                         types.append(Variable(value="dict"))
@@ -1142,7 +1634,9 @@ class ClientGenerator:
                         title,
                         zone,
                     )
-                    types.append(Variable(value=f'"{resolved_name}"'))
+                    types.append(
+                        Variable(value=f'"{self._get_clean_schema_name(title)}"')
+                    )
                 else:
                     types.append(self._get_type(variant, zone))
 
@@ -1166,6 +1660,14 @@ class ClientGenerator:
         if not schema:
             return Variable(value="Any")
 
+        # Проверяем что schema это словарь
+        if not isinstance(schema, dict):
+            # Если schema это bool или другой примитивный тип
+            if isinstance(schema, bool):
+                return Variable(value="bool")
+            else:
+                return Variable(value="Any")
+
         # Обработка enum с title (развернутая схема после jsonref)
         if schema.get("enum") and schema.get("title"):
             title = schema["title"]
@@ -1184,7 +1686,7 @@ class ClientGenerator:
                     found_schema, zone, include_zone_prefix=False
                 )
                 # С from __future__ import annotations кавычки не нужны
-                return Variable(value=f'"{resolved_name}"')
+                return Variable(value=f'"{self._get_clean_schema_name(found_schema)}"')
             else:
                 # Inline enum - создаем Literal вместо dependency
                 if schema.get("enum"):
@@ -1217,7 +1719,9 @@ class ClientGenerator:
                         )
 
                         # Используем модель с правильным именем
-                        types.append(Variable(value=f'"{resolved_name}"'))
+                        types.append(
+                            Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
+                        )
                     else:
                         # Fallback для незарегистрированных схем
                         types.append(Variable(value="dict"))
@@ -1229,7 +1733,10 @@ class ClientGenerator:
                     resolved_name = self.schema_resolver.resolve_schema_name(
                         title, zone, include_zone_prefix=False
                     )
-                    types.append(Variable(value=f'"{resolved_name}"'))
+                    # Ищем полное имя схемы по title
+                    full_name = self._find_schema_by_title(title)
+                    clean_name = self._get_clean_schema_name(full_name)
+                    types.append(Variable(value=f'"{clean_name}"'))
                 elif variant.get("type") == "array" and "items" in variant:
                     items = variant["items"]
                     if "$ref" in items:
@@ -1240,7 +1747,10 @@ class ClientGenerator:
                             ref_name, zone, include_zone_prefix=False
                         )
                         types.append(
-                            Variable(value=f'"{resolved_name}"', wrap_name="List")
+                            Variable(
+                                value=f'"{self._get_clean_schema_name(ref_name)}"',
+                                wrap_name="List",
+                            )
                         )
                     elif items.get("type") == "object" and "title" in items:
                         # Inline объект с title - используем fallback логику
@@ -1251,7 +1761,10 @@ class ClientGenerator:
                             title, zone, include_zone_prefix=False
                         )
                         types.append(
-                            Variable(value=f'"{resolved_name}"', wrap_name="List")
+                            Variable(
+                                value=f'"{self._get_clean_schema_name(ref_name)}"',
+                                wrap_name="List",
+                            )
                         )
                     else:
                         item_type = self._get_type_for_model_field(
@@ -1310,7 +1823,7 @@ class ClientGenerator:
                 )
 
                 # Используем модель с правильным именем
-                return Variable(value=f'"{resolved_name}"')
+                return Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
             else:
                 # Fallback для незарегистрированных схем
                 return Variable(value="dict")
@@ -1325,7 +1838,9 @@ class ClientGenerator:
                 resolved_name = self.schema_resolver.resolve_schema_name(
                     ref_name, zone, include_zone_prefix=False
                 )
-                return Variable(value=f'"{resolved_name}"', wrap_name="List")
+                return Variable(
+                    value=f'"{self._get_clean_schema_name(ref_name)}"', wrap_name="List"
+                )
             elif items.get("type") == "object" and "title" in items:
                 # Inline объект с title - используем fallback логику
                 title = items["title"]
@@ -1334,20 +1849,31 @@ class ClientGenerator:
                 resolved_name = self.schema_resolver.resolve_schema_name(
                     title, zone, include_zone_prefix=False
                 )
-                return Variable(value=f'"{resolved_name}"', wrap_name="List")
+                full_name = self._find_schema_by_title(title)
+                clean_name = self._get_clean_schema_name(full_name)
+                return Variable(value=f'"{clean_name}"', wrap_name="List")
             else:
                 item_type = self._get_type_for_model_field(items, zone, dependencies)
                 return Variable(value=item_type, wrap_name="List")
 
-        # Inline object с title (развернутая схема)
-        if schema.get("type") == "object" and "title" in schema:
-            # Проверяем additionalProperties - это должно быть Dict, а не модель
-            if "additionalProperties" in schema:
-                additional_props = schema["additionalProperties"]
+        # Проверяем объекты с additionalProperties без properties - это должно быть Dict
+        if (
+            schema.get("type") == "object"
+            and "additionalProperties" in schema
+            and not schema.get("properties")
+        ):
+            # Объект только с additionalProperties без properties - это Dict, даже если есть title
+            additional_props = schema["additionalProperties"]
+            if additional_props is True:
+                return Variable(value="str, Any", wrap_name="Dict")
+            else:
                 value_type = self._get_type_for_model_field(
                     additional_props, zone, dependencies
                 )
                 return Variable(value=f"str, {value_type}", wrap_name="Dict")
+
+        # Inline object с title (развернутая схема)
+        if schema.get("type") == "object" and "title" in schema:
 
             title = schema["title"]
 
@@ -1394,7 +1920,7 @@ class ClientGenerator:
                 resolved_name = self.schema_resolver.resolve_schema_name(
                     found_schema, zone, include_zone_prefix=False
                 )
-                return Variable(value=f'"{resolved_name}"')
+                return Variable(value=f'"{self._get_clean_schema_name(found_schema)}"')
 
             # Fallback - используем title как есть
             if dependencies is not None:
@@ -1447,7 +1973,9 @@ class ClientGenerator:
                     title, zone, include_zone_prefix=False
                 )
 
-            return Variable(value=f'"{resolved_name}"')
+            full_name = self._find_schema_by_title(title)
+            clean_name = self._get_clean_schema_name(full_name)
+            return Variable(value=f'"{clean_name}"')
 
         # Fallback к обычному типу
         return self._get_type(schema, zone)
@@ -1456,6 +1984,14 @@ class ClientGenerator:
         """Получение типа для endpoint параметра с полной поддержкой моделей"""
         if not schema:
             return Variable(value="Any")
+
+        # Проверяем что schema это словарь
+        if not isinstance(schema, dict):
+            # Если schema это bool или другой примитивный тип
+            if isinstance(schema, bool):
+                return Variable(value="bool")
+            else:
+                return Variable(value="Any")
 
         # Прямой $ref для endpoint параметров - ПРИОРИТЕТ 1
         if "$ref" in schema:
@@ -1477,7 +2013,7 @@ class ClientGenerator:
 
             # Для endpoint параметров используем оригинальное имя с кросс-ссылками
             resolved_name = self.schema_resolver.resolve_schema_name(ref_name, "")
-            return Variable(value=f'"{resolved_name}"')
+            return Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
 
         # anyOf/oneOf в параметре endpoint
         if schema.get("anyOf") or schema.get("oneOf"):
@@ -1494,7 +2030,9 @@ class ClientGenerator:
                     resolved_name = self.schema_resolver.resolve_schema_name(
                         ref_name, ""
                     )
-                    types.append(Variable(value=f'"{resolved_name}"'))
+                    types.append(
+                        Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
+                    )
                 else:
                     types.append(self._get_type_for_endpoint_parameter(variant))
 
@@ -1515,7 +2053,9 @@ class ClientGenerator:
                 ref_name = items["$ref"].replace("#/components/schemas/", "")
                 # Для endpoint параметров используем кросс-ссылки
                 resolved_name = self.schema_resolver.resolve_schema_name(ref_name, "")
-                return Variable(value=f'"{resolved_name}"', wrap_name="List")
+                return Variable(
+                    value=f'"{self._get_clean_schema_name(ref_name)}"', wrap_name="List"
+                )
             else:
                 item_type = self._get_type_for_endpoint_parameter(items)
                 return Variable(value=item_type, wrap_name="List")
@@ -1531,7 +2071,9 @@ class ClientGenerator:
             title = schema["title"]
             # Пытаемся найти зарегистрированную схему по title
             resolved_name = self.schema_resolver.resolve_schema_name(title, "")
-            return Variable(value=f'"{resolved_name}"')
+            full_name = self._find_schema_by_title(title)
+            clean_name = self._get_clean_schema_name(full_name)
+            return Variable(value=f'"{clean_name}"')
 
         # Fallback к обычному типу - используем базовые типы
         schema_type = schema.get("type", "string")
@@ -1544,6 +2086,99 @@ class ClientGenerator:
             "array": "list",
         }
         return Variable(value=type_mapping.get(schema_type, "str"))
+
+    def _is_array_response(self, responses: Dict) -> bool:
+        """Проверяет, является ли успешный ответ массивом"""
+        for status_code, response_spec in responses.items():
+            if status_code.startswith("2"):
+                content = response_spec.get("content", {})
+                if content:
+                    for content_type, content_spec in content.items():
+                        schema = content_spec.get("schema", {})
+                        if schema.get("type") == "array":
+                            return True
+        return False
+
+    def _get_response_models_list(self, responses: Dict, zone: str) -> list:
+        """Получение списка моделей для Union типов (для умного парсинга)"""
+        if not zone or zone == "common":
+            zone = None
+
+        for status_code, response_spec in responses.items():
+            if status_code.startswith("2"):
+                content = response_spec.get("content", {})
+                if content:
+                    for content_type, content_spec in content.items():
+                        schema = content_spec.get("schema", {})
+
+                        # Обработка anyOf/oneOf структур
+                        if schema.get("anyOf") or schema.get("oneOf"):
+                            variants = schema.get("anyOf", []) + schema.get("oneOf", [])
+                            model_classes = []
+
+                            for variant in variants:
+                                if "$ref" in variant:
+                                    ref_name = variant["$ref"].replace(
+                                        "#/components/schemas/", ""
+                                    )
+                                    clean_name = self._get_clean_schema_name(ref_name)
+                                    model_classes.append(clean_name)
+                                elif (
+                                    variant.get("type") == "object"
+                                    and "title" in variant
+                                ):
+                                    title = variant["title"]
+                                    found = False
+                                    for schema_name, schema_spec in (
+                                        self.openapi_dict.get("components", {})
+                                        .get("schemas", {})
+                                        .items()
+                                    ):
+                                        if schema_spec.get("title") == title:
+                                            schema_clean_name = (
+                                                self._get_clean_schema_name(schema_name)
+                                            )
+                                            if zone:
+                                                zone_lower = zone.lower()
+                                                schema_lower = schema_clean_name.lower()
+                                                title_lower = title.lower()
+
+                                                zone_match = (
+                                                    zone_lower in schema_lower
+                                                    or any(
+                                                        part in schema_lower
+                                                        for part in zone_lower.split(
+                                                            "_"
+                                                        )
+                                                        if len(part) > 2
+                                                    )
+                                                )
+                                                title_match = (
+                                                    title_lower in schema_lower
+                                                )
+
+                                                if zone_match and title_match:
+                                                    model_classes.append(
+                                                        schema_clean_name
+                                                    )
+                                                    found = True
+                                                    break
+                                            else:
+                                                if schema_clean_name:
+                                                    model_classes.append(
+                                                        schema_clean_name
+                                                    )
+                                                    found = True
+                                                    break
+                                    if not found:
+                                        full_name = self._find_schema_by_title(title)
+                                        clean_name = self._get_clean_schema_name(
+                                            full_name
+                                        )
+                                        model_classes.append(clean_name)
+
+                            return model_classes
+        return []
 
     def _get_clean_model_type(self, responses: Dict, zone: str) -> str:
         """Получение чистого типа модели для response_model без Optional оберток"""
@@ -1563,20 +2198,22 @@ class ClientGenerator:
                         # Обработка anyOf/oneOf структур
                         if schema.get("anyOf") or schema.get("oneOf"):
                             variants = schema.get("anyOf", []) + schema.get("oneOf", [])
+                            type_variants = []
+
                             for variant in variants:
                                 if "$ref" in variant:
                                     ref_name = variant["$ref"].replace(
                                         "#/components/schemas/", ""
                                     )
                                     clean_name = self._get_clean_schema_name(ref_name)
-                                    # Возвращаем первую найденную модель без Optional
-                                    return clean_name
+                                    type_variants.append(clean_name)
                                 elif (
                                     variant.get("type") == "object"
                                     and "title" in variant
                                 ):
                                     # Инлайн объект с title
                                     title = variant["title"]
+                                    found = False
                                     # Ищем схему с таким title в правильной зоне
                                     for schema_name, schema_spec in (
                                         self.openapi_dict.get("components", {})
@@ -1609,12 +2246,31 @@ class ClientGenerator:
                                                 )
 
                                                 if zone_match and title_match:
-                                                    return schema_clean_name
+                                                    type_variants.append(
+                                                        schema_clean_name
+                                                    )
+                                                    found = True
+                                                    break
                                             else:
                                                 if schema_clean_name:
-                                                    return schema_clean_name
-                                    # Простой fallback
-                                    return title
+                                                    type_variants.append(
+                                                        schema_clean_name
+                                                    )
+                                                    found = True
+                                                    break
+                                    if not found:
+                                        # Простой fallback - ищем полное имя схемы по title
+                                        full_name = self._find_schema_by_title(title)
+                                        clean_name = self._get_clean_schema_name(
+                                            full_name
+                                        )
+                                        type_variants.append(clean_name)
+
+                            # Возвращаем Union тип если несколько вариантов
+                            if len(type_variants) == 1:
+                                return type_variants[0]
+                            elif len(type_variants) > 1:
+                                return f"Union[{', '.join(type_variants)}]"
                         elif "$ref" in schema:
                             # Прямая ссылка на модель
                             ref_name = schema["$ref"].replace(
@@ -1632,9 +2288,55 @@ class ClientGenerator:
                                 clean_name = self._get_clean_schema_name(ref_name)
                                 # Для массивов возвращаем модель элемента, handle_request сам создаст список
                                 return clean_name
+                            elif items.get("type") == "object" and "title" in items:
+                                # Развернутая схема с title после jsonref
+                                title = items["title"]
+                                # Ищем схему по title в components/schemas
+                                # Для response приоритизируем Output модели
+                                schemas = self.openapi_dict.get("components", {}).get(
+                                    "schemas", {}
+                                )
+                                found_schema_name = None
+                                output_schema_name = None
+
+                                for schema_name, schema_spec in schemas.items():
+                                    if schema_spec.get("title") == title:
+                                        if (
+                                            "Output" in schema_name
+                                            or "output" in schema_name
+                                        ):
+                                            output_schema_name = schema_name
+                                        elif found_schema_name is None:
+                                            found_schema_name = schema_name
+
+                                # Предпочитаем Output модель если есть
+                                final_schema_name = (
+                                    output_schema_name or found_schema_name
+                                )
+                                if final_schema_name:
+                                    clean_name = self._get_clean_schema_name(
+                                        final_schema_name
+                                    )
+                                    return clean_name
+
+                                # Fallback - ищем зарегистрированную схему по title
+                                for schema_name, schema_spec in (
+                                    self.openapi_dict.get("components", {})
+                                    .get("schemas", {})
+                                    .items()
+                                ):
+                                    if schema_spec.get("title") == title:
+                                        clean_name = self._get_clean_schema_name(
+                                            schema_name
+                                        )
+                                        return clean_name
+                                # Fallback - возвращаем Any если схема не найдена
+                                return "Any"
                         elif schema.get("type") == "object" and "title" in schema:
-                            # Проверяем additionalProperties - это должно быть Dict, а не модель
-                            if "additionalProperties" in schema:
+                            # Проверяем additionalProperties - это должно быть Dict только если нет properties
+                            if "additionalProperties" in schema and not schema.get(
+                                "properties"
+                            ):
                                 return (
                                     "dict"  # Для response_model используем обычный dict
                                 )
@@ -1673,7 +2375,133 @@ class ClientGenerator:
                                         # Если нет зоны, возвращаем первую найденную
                                         if schema_clean_name:
                                             return schema_clean_name
-                            # Fallback - используем title как есть
-                            clean_name = self._get_clean_schema_name(title)
+                            # Fallback - ищем полное имя схемы по title
+                            full_name = self._find_schema_by_title(title)
+                            clean_name = self._get_clean_schema_name(full_name)
                             return clean_name
         return "Any"
+
+    def _determine_whole_body_fields(
+        self, request_body: Dict, zone: str = ""
+    ) -> List[str]:
+        """Определяет какие поля должны передаваться как целое body"""
+        whole_body_fields = []
+        content = request_body.get("content", {})
+
+        for content_type, content_spec in content.items():
+            schema = content_spec.get("schema", {})
+
+            # Если schema ссылается на модель напрямую через $ref - это значит весь body это одна модель
+            # В этом случае генератор создаст параметр request_body или data_body
+            if "$ref" in schema:
+                # Если это Union тип или одиночная модель - поле data должно передаваться целиком
+                whole_body_fields.append("data")
+                continue
+
+            # Если это anyOf/oneOf - тоже Union типы, data должно быть целым
+            if schema.get("anyOf") or schema.get("oneOf"):
+                whole_body_fields.append("data")
+                continue
+
+            # Если это array - массив должен передаваться целиком
+            if schema.get("type") == "array":
+                title = schema.get("title", "models")
+                clean_title = self._clean_parameter_name(title)
+                snake_case_title = self._snake_case(clean_title)
+                whole_body_fields.append(snake_case_title)
+                continue
+
+            # Если это object со свойствами
+            if schema.get("type") == "object":
+                properties = schema.get("properties", {})
+
+                # Проверяем каждое свойство
+                for prop_name, prop_schema in properties.items():
+                    # Очищаем имя свойства так же, как это делается при создании параметров
+                    clean_prop_name = self._clean_parameter_name(prop_name)
+
+                    # Если свойство ссылается на модель
+                    if "$ref" in prop_schema:
+                        # Проверяем, не создается ли для этого поля отдельный параметр _body
+                        # Если создается параметр {clean_prop_name}_body, то не включаем в whole_body_fields
+                        # Это поле должно передаваться целиком только если оно единственное или особое
+                        if len(properties) == 1:
+                            # Если это единственное свойство, передаем как whole_body
+                            whole_body_fields.append(prop_name)
+                        # Если свойств несколько, каждое будет отдельным параметром _body
+                        continue
+                    # Если это anyOf/oneOf в свойстве - проверяем что это не просто Optional
+                    elif prop_schema.get("anyOf") or prop_schema.get("oneOf"):
+                        variants = prop_schema.get("anyOf", []) + prop_schema.get(
+                            "oneOf", []
+                        )
+                        # Если есть $ref в вариантах - это модель
+                        has_model_ref = any("$ref" in variant for variant in variants)
+                        # Если это не просто Optional (не только string + null)
+                        is_simple_optional = (
+                            len(variants) == 2
+                            and any(v.get("type") == "null" for v in variants)
+                            and any(
+                                v.get("type")
+                                in ["string", "integer", "number", "boolean"]
+                                for v in variants
+                            )
+                        )
+                        if has_model_ref or not is_simple_optional:
+                            # Аналогично проверяем - если свойств несколько, каждое будет параметром
+                            if len(properties) == 1:
+                                whole_body_fields.append(prop_name)
+                            continue
+                    # Если это сложный объект без $ref, но с несколькими свойствами
+                    elif (
+                        prop_schema.get("type") == "object"
+                        and len(prop_schema.get("properties", {})) > 1
+                    ):
+                        # Аналогично проверяем - если свойств несколько, каждое будет параметром
+                        if len(properties) == 1:
+                            whole_body_fields.append(prop_name)
+
+        return whole_body_fields
+
+    def _create_field_mapping(
+        self, request_body: Dict, zone: str = ""
+    ) -> Dict[str, str]:
+        """Создает маппинг полей с кривыми именами на оригинальные имена"""
+        field_mapping = {}
+        content = request_body.get("content", {})
+
+        for content_type, content_spec in content.items():
+            schema = content_spec.get("schema", {})
+
+            # Если schema ссылается на модель через $ref
+            if "$ref" in schema:
+                ref_name = schema["$ref"].replace("#/components/schemas/", "")
+                # Получаем схему модели
+                schemas = self.openapi_dict.get("components", {}).get("schemas", {})
+                if ref_name in schemas:
+                    model_schema = schemas[ref_name]
+                    properties = model_schema.get("properties", {})
+
+                    for original_name, prop_schema in properties.items():
+                        # Очищаем имя параметра так же как делает генератор
+                        clean_name = self._clean_parameter_name(original_name)
+                        snake_case_name = self._snake_case(clean_name)
+
+                        # Если очищенное имя отличается от оригинального
+                        if snake_case_name != original_name:
+                            field_mapping[snake_case_name] = original_name
+
+            # Если это object со свойствами напрямую
+            elif schema.get("type") == "object":
+                properties = schema.get("properties", {})
+
+                for original_name, prop_schema in properties.items():
+                    # Очищаем имя параметра так же как делает генератор
+                    clean_name = self._clean_parameter_name(original_name)
+                    snake_case_name = self._snake_case(clean_name)
+
+                    # Если очищенное имя отличается от оригинального
+                    if snake_case_name != original_name:
+                        field_mapping[snake_case_name] = original_name
+
+        return field_mapping

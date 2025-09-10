@@ -1,29 +1,7 @@
 class Templates:
     """Шаблоны для генерации файлов"""
 
-    lib_exc = """class SendRequestError(Exception):
-    def __init__(self, message, path, status_code, response_data=None) -> None:
-        self.message = message
-        self.path = path
-        self.status_code = status_code
-        self.response_data = response_data
-        super().__init__(f"[{status_code}] {path}: {message}")
-
-class ValidationError(SendRequestError):
-    pass
-
-class AuthenticationError(SendRequestError):
-    pass
-
-class NotFoundError(SendRequestError):
-    pass
-
-class ServerError(SendRequestError):
-    pass
-"""
-
     models = """from typing import Any
-
 
 class _NotSetType:
     def __repr__(self) -> str:
@@ -226,7 +204,7 @@ class AiohttpClient:
             content_type: str = None,
             params: dict = None,
             files: dict = None,
-            data: Union[dict, str] = None,
+            data: Union[dict, list, str] = None,
             headers: Dict[str, str] = None
     ) -> Any:
 
@@ -249,7 +227,7 @@ class AiohttpClient:
                     request_kwargs = {
                         'method': method,
                         'url': full_url,
-                        'params': params,
+                        'params': json.dumps(params) if params else None,
                     }
 
                     # Добавление кастомных headers
@@ -271,8 +249,8 @@ class AiohttpClient:
                         request_kwargs['data'] = form_data
                     else:
                         # Обработка JSON или form data
-                        if isinstance(data, dict):
-                            # По умолчанию отправляем JSON для словарей
+                        if isinstance(data, (dict, list)):
+                            # По умолчанию отправляем JSON для словарей и списков
                             if content_type == "application/x-www-form-urlencoded":
                                 request_kwargs['data'] = data
                             else:
@@ -416,7 +394,7 @@ DecoratedCallable = TypeVar("DecoratedCallable", bound=Callable[..., Any])
 
 
 def http_method(
-    method: str, path: str, response_model=None
+    method: str, path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     \"\"\"Базовый декоратор для HTTP методов с полной обработкой\"\"\"
 
@@ -457,7 +435,10 @@ def http_method(
                 method, 
                 formatted_path.rstrip('/'), 
                 locals_dict, 
-                response_model=response_model
+                response_model=response_model,
+                response_models=response_models,
+                whole_body_fields=whole_body_fields,
+                field_mapping=field_mapping
             )
         
         # Сохраняем метаданные для отладки
@@ -471,33 +452,33 @@ def http_method(
 
 
 def get(
-    path: str, response_model=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("get", path, response_model)
+    return http_method("get", path, response_model, response_models, whole_body_fields, field_mapping)
 
 
 def post(
-    path: str, response_model=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("post", path, response_model)
+    return http_method("post", path, response_model, response_models, whole_body_fields, field_mapping)
 
 
 def put(
-    path: str, response_model=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("put", path, response_model)
+    return http_method("put", path, response_model, response_models, whole_body_fields, field_mapping)
 
 
 def delete(
-    path: str, response_model=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("delete", path, response_model)
+    return http_method("delete", path, response_model, response_models, whole_body_fields, field_mapping)
 
 
 def patch(
-    path: str, response_model=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("patch", path, response_model)
+    return http_method("patch", path, response_model, response_models, whole_body_fields, field_mapping)
 """
 
     utils = """\"\"\"
@@ -505,6 +486,7 @@ def patch(
 \"\"\"
 
 from typing import Optional, Dict, Any
+from datetime import datetime, date
 from . import constants
 
 
@@ -512,27 +494,91 @@ def is_not_set(value: Any) -> bool:
     return value is constants.NOTSET
 
 
+def serialize_value(value: Any) -> Any:
+    \"\"\"Рекурсивная сериализация значений для JSON\"\"\"
+    if isinstance(value, datetime):
+        return value.isoformat()
+    elif isinstance(value, date):
+        return value.isoformat()
+    elif isinstance(value, bytes):
+        # Кодируем bytes в base64 для JSON
+        import base64
+        return base64.b64encode(value).decode('utf-8')
+    elif isinstance(value, dict):
+        return {k: serialize_value(v) for k, v in value.items()}
+    elif isinstance(value, (list, tuple)):
+        return [serialize_value(item) for item in value]
+    elif hasattr(value, 'model_dump'):
+        # Pydantic модель - используем model_dump с сериализацией
+        return serialize_value(value.model_dump())
+    else:
+        return value
+
+
 def prepare_params(locals_dict: dict) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка query параметров\"\"\"
-    params = {
-        k[:-6]: v 
-        for k, v in locals_dict.items() 
-        if k.endswith('_query') and not is_not_set(v)
-    }
+    params = {}
+    for k, v in locals_dict.items():
+        if k.endswith('_query') and not is_not_set(v):
+            # Сериализуем query параметры (особенно важно для дат)
+            params[k[:-6]] = serialize_value(v)
     return params if params else None
 
 
-def prepare_body_data(locals_dict: dict) -> Optional[Dict[str, Any]]:
+def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=None) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка body данных с автоматической конвертацией моделей\"\"\"
+    if whole_body_fields is None:
+        whole_body_fields = []
+    if field_mapping is None:
+        field_mapping = {}
+    
     body_data = {}
+    additional_fields = {}
+    whole_body_value = None
+    other_body_fields = {}
+    
     for k, v in locals_dict.items():
         if k.endswith('_body') and not is_not_set(v):
-            if hasattr(v, 'model_dump'):
-                body_data[k[:-5]] = v.model_dump()
-            elif isinstance(v, list) and v and hasattr(v[0], 'model_dump'):
-                body_data[k[:-5]] = [item.model_dump() for item in v]
+            field_name = k[:-5]
+            
+            # Проверяем если это поле указано как whole_body_field
+            if field_name in whole_body_fields:
+                # Это поле передается как весь body целиком
+                whole_body_value = serialize_value(v)
+                break  # Если найдено whole_body поле, используем только его
+            elif k.startswith('additional_fields_body'):
+                # Специальная обработка дополнительных полей - распаковываем их
+                if isinstance(v, dict):
+                    # Сериализуем дополнительные поля
+                    serialized_additional = serialize_value(v)
+                    additional_fields.update(serialized_additional)
             else:
-                body_data[k[:-5]] = v
+                # Обычные поля - сериализуем все значения
+                # Используем маппинг если есть, иначе оригинальное имя
+                actual_field_name = field_mapping.get(field_name, field_name)
+                other_body_fields[actual_field_name] = serialize_value(v)
+    
+    # Если есть whole_body поле, используем его как весь body
+    if whole_body_value is not None:
+        return whole_body_value
+    
+    # Если есть только одно body поле, проверяем нужно ли передать его как весь body
+    if len(other_body_fields) == 1 and not additional_fields:
+        single_field_name, single_field_value = next(iter(other_body_fields.items()))
+        
+        # Если это поле называется как типичные "целые body" имена
+        # или если это сложный объект (Pydantic модель), передаем как весь body
+        whole_body_names = ['data', 'model', 'request', 'body', 'item', 'payload']
+        
+        if (single_field_name in whole_body_names or
+            (hasattr(single_field_value, 'keys') and isinstance(single_field_value, dict) and 
+             len(single_field_value) > 1)):  # Сложный объект с несколькими полями
+            return single_field_value
+    
+    # Иначе собираем body из отдельных полей
+    body_data.update(other_body_fields)
+    body_data.update(additional_fields)
+    
     return body_data if body_data else None
 
 
@@ -546,10 +592,10 @@ def prepare_files(locals_dict: dict) -> Optional[Dict[str, Any]]:
     return files if files else None
 
 
-async def handle_request(client, method: str, path: str, locals_dict: dict, response_model=None) -> Any:
+async def handle_request(client, method: str, path: str, locals_dict: dict, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None) -> Any:
     \"\"\"Обработка HTTP запроса с автоматической подготовкой параметров и парсингом response модели\"\"\"
     params = prepare_params(locals_dict)
-    data = prepare_body_data(locals_dict)
+    data = prepare_body_data(locals_dict, whole_body_fields, field_mapping)
     files = prepare_files(locals_dict)
     
     response = await client._send_request(
@@ -589,8 +635,22 @@ async def handle_request(client, method: str, path: str, locals_dict: dict, resp
         # Если все способы не сработали, возвращаем сырой response
         return response
     
-    # Если указана модель для парсинга, пытаемся парсить (только для JSON)
-    if response_model is not None and isinstance(response_data, (dict, list)):
+    # Если указан список моделей (Union типы), пытаемся парсить каждую по очереди
+    if response_models is not None and isinstance(response_data, (dict, list)):
+        for model in response_models:
+            try:
+                if isinstance(response_data, list):
+                    return [model(**item) for item in response_data]
+                else:
+                    return model(**response_data)
+            except Exception:
+                # Пробуем следующую модель
+                continue
+        # Если ни одна модель не подошла, возвращаем raw data
+        pass
+    
+    # Если указана одна модель для парсинга, пытаемся парсить (только для JSON)
+    elif response_model is not None and isinstance(response_data, (dict, list)):
         try:
             # Если response_data - это список, создаем список моделей
             if isinstance(response_data, list):

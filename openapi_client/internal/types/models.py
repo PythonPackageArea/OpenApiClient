@@ -63,6 +63,7 @@ class Parameter(BaseModel):
 
     default: Optional[Variable] = None
     var_type: Optional[Variable] = None
+    is_whole_body: bool = False  # Флаг что это весь body объект целиком
 
     order: int = 0
 

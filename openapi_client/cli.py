@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import glob
+import traceback
 from typing import List, Tuple, Optional
 
 from openapi_client.internal.types.models import Project
@@ -235,6 +236,7 @@ def _generate_client(config: OpenApiConfig, work_dir: str):
 
     except Exception as e:
         print(f"❌ Ошибка генерации: {e}")
+        traceback.print_exc()
         raise
 
 
@@ -246,6 +248,7 @@ def _generate_client_in_existing(config: OpenApiConfig, existing_package_dir: st
 
     except Exception as e:
         print(f"❌ Ошибка генерации: {e}")
+        traceback.print_exc()
         raise
 
 
@@ -359,6 +362,7 @@ def generate():
 
     except Exception as e:
         print(f"❌ Ошибка генерации: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
 
