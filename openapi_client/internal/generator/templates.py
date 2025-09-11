@@ -406,13 +406,13 @@ HTTP декораторы для endpoints (FastAPI-style)
 import inspect
 from functools import wraps
 from typing import Optional, Any, Callable, TypeVar
-from .utils import handle_request
+from .utils import handle_request, filter_params_by_suffix
 
 DecoratedCallable = TypeVar("DecoratedCallable", bound=Callable[..., Any])
 
 
 def http_method(
-    method: str, path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
+    method: str, path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     \"\"\"Базовый декоратор для HTTP методов с полной обработкой\"\"\"
 
@@ -426,14 +426,15 @@ def http_method(
             
             locals_dict = dict(bound_args.arguments)
             
-            # Подставляем path параметры  
+            # Подставляем path параметры используя утилиты
+            
             formatted_path = path
-            for key, value in locals_dict.items():
-                if key.endswith('_path') and value is not None:
-                    param_name = key[:-5]  # убираем _path суффикс
-                    
+            path_params = filter_params_by_suffix(locals_dict, '_path')
+            
+            for param_name, value, field_name in path_params:
+                if value is not None:
                     # Ищем все возможные варианты плейсхолдеров
-                    target_placeholder = '{' + param_name + '}'
+                    target_placeholder = '{' + field_name + '}'
                     if target_placeholder in formatted_path:
                         formatted_path = formatted_path.replace(target_placeholder, str(value))
                     else:
@@ -456,7 +457,9 @@ def http_method(
                 response_model=response_model,
                 response_models=response_models,
                 whole_body_fields=whole_body_fields,
-                field_mapping=field_mapping
+                field_mapping=field_mapping,
+                param_mapping=param_mapping,
+                body_required=body_required
             )
         
         # Сохраняем метаданные для отладки
@@ -470,33 +473,33 @@ def http_method(
 
 
 def get(
-    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("get", path, response_model, response_models, whole_body_fields, field_mapping)
+    return http_method("get", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
 def post(
-    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("post", path, response_model, response_models, whole_body_fields, field_mapping)
+    return http_method("post", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
 def put(
-    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("put", path, response_model, response_models, whole_body_fields, field_mapping)
+    return http_method("put", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
 def delete(
-    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("delete", path, response_model, response_models, whole_body_fields, field_mapping)
+    return http_method("delete", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
 def patch(
-    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None
+    path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
-    return http_method("patch", path, response_model, response_models, whole_body_fields, field_mapping)
+    return http_method("patch", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 """
 
     utils = """\"\"\"
@@ -560,18 +563,81 @@ def serialize_query_value(value: Any) -> Any:
         return value
 
 
-def prepare_params(locals_dict: dict) -> Optional[Dict[str, Any]]:
+def extract_field_name_from_param(param_name: str, suffix: str) -> str:
+    \"\"\"Извлекает имя поля из имени параметра, правильно обрабатывая rfind\"\"\"
+    if suffix in param_name:
+        suffix_pos = param_name.rfind(suffix)
+        base_name = param_name[:suffix_pos]
+        remainder = param_name[suffix_pos + len(suffix):]
+        field_name = base_name + remainder if remainder else base_name
+        return field_name
+    else:
+        return param_name
+
+
+def filter_params_by_suffix(locals_dict: dict, suffix: str) -> list:
+    \"\"\"Фильтрует параметры по суффиксу, исключая NOTSET значения\"\"\"
+    result = []
+    for param_name, value in locals_dict.items():
+        if suffix in param_name and param_name != 'self' and not is_not_set(value):
+            field_name = extract_field_name_from_param(param_name, suffix)
+            result.append((param_name, value, field_name))
+    return result
+
+
+def prepare_params(locals_dict: dict, param_mapping: dict = None) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка query параметров\"\"\"
+    
     params = {}
-    for k, v in locals_dict.items():
-        if k.endswith('_query') and not is_not_set(v):
-            # Сериализуем query параметры (особенно важно для дат и boolean)
-            params[k[:-6]] = serialize_query_value(v)
+    query_params = filter_params_by_suffix(locals_dict, '_query')
+    
+    for param_name, value, field_name in query_params:
+        # Используем оригинальное имя из param_mapping если доступно
+        if param_mapping and param_name in param_mapping:
+            original_name = param_mapping[param_name]["name"]
+        else:
+            original_name = field_name
+        # Сериализуем query параметры (особенно важно для дат и boolean)
+        params[original_name] = serialize_query_value(value)
+    
     return params if params else None
 
 
-def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=None) -> Optional[Dict[str, Any]]:
+def prepare_headers(locals_dict: dict, param_mapping: dict = None) -> Optional[Dict[str, Any]]:
+    \"\"\"Подготовка header параметров\"\"\"
+    
+    headers = {}
+    
+    # Ищем параметры которые являются headers по param_mapping
+    if param_mapping:
+        for param_name, value in locals_dict.items():
+            if param_name != 'self' and not is_not_set(value) and param_name in param_mapping:
+                param_info = param_mapping[param_name]
+                if param_info["type"] == "header":
+                    headers[param_info["name"]] = str(value)
+    
+    return headers if headers else None
+
+
+def prepare_cookies(locals_dict: dict, param_mapping: dict = None) -> Optional[Dict[str, Any]]:
+    \"\"\"Подготовка cookie параметров\"\"\"
+    
+    cookies = {}
+    
+    # Ищем параметры которые являются cookies по param_mapping  
+    if param_mapping:
+        for param_name, value in locals_dict.items():
+            if param_name != 'self' and not is_not_set(value) and param_name in param_mapping:
+                param_info = param_mapping[param_name]
+                if param_info["type"] == "cookie":
+                    cookies[param_info["name"]] = str(value)
+    
+    return cookies if cookies else None
+
+
+def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=None, body_required=False) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка body данных с автоматической конвертацией моделей\"\"\"
+    
     if whole_body_fields is None:
         whole_body_fields = []
     if field_mapping is None:
@@ -582,26 +648,27 @@ def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=N
     whole_body_value = None
     other_body_fields = {}
     
-    for k, v in locals_dict.items():
-        if k.endswith('_body') and not is_not_set(v):
-            field_name = k[:-5]
+    # Используем утилиту для фильтрации body параметров
+    body_params = filter_params_by_suffix(locals_dict, '_body')
+    
+    for param_name, value, field_name in body_params:
             
-            # Проверяем если это поле указано как whole_body_field
-            if field_name in whole_body_fields:
-                # Это поле передается как весь body целиком
-                whole_body_value = serialize_value(v)
-                break  # Если найдено whole_body поле, используем только его
-            elif k.startswith('additional_fields_body'):
-                # Специальная обработка дополнительных полей - распаковываем их
-                if isinstance(v, dict):
-                    # Сериализуем дополнительные поля
-                    serialized_additional = serialize_value(v)
-                    additional_fields.update(serialized_additional)
-            else:
-                # Обычные поля - сериализуем все значения
-                # Используем маппинг если есть, иначе оригинальное имя
-                actual_field_name = field_mapping.get(field_name, field_name)
-                other_body_fields[actual_field_name] = serialize_value(v)
+        # Проверяем если это поле указано как whole_body_field
+        if field_name in whole_body_fields:
+            # Это поле передается как весь body целиком
+            whole_body_value = serialize_value(value)
+            break  # Если найдено whole_body поле, используем только его
+        elif param_name.startswith('additional_fields_body'):
+            # Специальная обработка дополнительных полей - распаковываем их
+            if isinstance(value, dict):
+                # Сериализуем дополнительные поля
+                serialized_additional = serialize_value(value)
+                additional_fields.update(serialized_additional)
+        else:
+            # Обычные поля - сериализуем все значения
+            # Используем маппинг если есть, иначе оригинальное имя
+            actual_field_name = field_mapping.get(field_name, field_name)
+            other_body_fields[actual_field_name] = serialize_value(value)
     
     # Если есть whole_body поле, используем его как весь body
     if whole_body_value is not None:
@@ -622,40 +689,60 @@ def prepare_body_data(locals_dict: dict, whole_body_fields=None, field_mapping=N
     body_data.update(other_body_fields)
     body_data.update(additional_fields)
     
+    # Если body обязательный и нет данных, возвращаем пустой словарь
+    if not body_data and body_required:
+        return {}
+    
     return body_data if body_data else None
 
 
 def prepare_files(locals_dict: dict) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка file параметров (bytes и List[bytes])\"\"\"
+    
     files = {}
-    for k, v in locals_dict.items():
-        if k.endswith('_file') and not is_not_set(v):
-            # bytes или список bytes считаются файлами
-            if isinstance(v, bytes):
-                files[k[:-5]] = v
-            elif isinstance(v, list) and v and isinstance(v[0], bytes):
-                # Список bytes файлов
-                files[k[:-5]] = v
+    file_params = filter_params_by_suffix(locals_dict, '_file')
+    
+    for param_name, value, field_name in file_params:
+        # bytes или список bytes считаются файлами
+        if isinstance(value, bytes):
+            files[field_name] = value
+        elif isinstance(value, list) and value and isinstance(value[0], bytes):
+            # Список bytes файлов
+            files[field_name] = value
+    
     return files if files else None
 
 
 def prepare_form_data(locals_dict: dict) -> Optional[Dict[str, Any]]:
     \"\"\"Подготовка form данных (не файлы)\"\"\"
+    
     form_data = {}
-    for k, v in locals_dict.items():
-        if k.endswith('_file') and not is_not_set(v):
-            # Исключаем bytes и List[bytes] - это файлы
-            if not isinstance(v, bytes) and not (isinstance(v, list) and v and isinstance(v[0], bytes)):
-                form_data[k[:-5]] = serialize_value(v)
+    file_params = filter_params_by_suffix(locals_dict, '_file')
+    
+    for param_name, value, field_name in file_params:
+        # Исключаем bytes и List[bytes] - это файлы
+        if not isinstance(value, bytes) and not (isinstance(value, list) and value and isinstance(value[0], bytes)):
+            form_data[field_name] = serialize_value(value)
+    
     return form_data if form_data else None
 
 
-async def handle_request(client, method: str, path: str, locals_dict: dict, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None) -> Any:
+async def handle_request(client, method: str, path: str, locals_dict: dict, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False) -> Any:
     \"\"\"Обработка HTTP запроса с автоматической подготовкой параметров и парсингом response модели\"\"\"
-    params = prepare_params(locals_dict)
-    data = prepare_body_data(locals_dict, whole_body_fields, field_mapping)
+    params = prepare_params(locals_dict, param_mapping)
+    data = prepare_body_data(locals_dict, whole_body_fields, field_mapping, body_required)
     files = prepare_files(locals_dict)
     form_data = prepare_form_data(locals_dict)
+    headers = prepare_headers(locals_dict, param_mapping)
+    cookies = prepare_cookies(locals_dict, param_mapping)
+    
+    # Добавляем cookies в headers как Cookie заголовок
+    if cookies:
+        cookie_header = "; ".join([f"{name}={value}" for name, value in cookies.items()])
+        if headers:
+            headers["Cookie"] = cookie_header
+        else:
+            headers = {"Cookie": cookie_header}
     
     # Объединяем form_data с data для multipart запросов
     if form_data:
@@ -674,7 +761,8 @@ async def handle_request(client, method: str, path: str, locals_dict: dict, resp
         path=path,
         params=params,
         data=data,
-        files=files
+        files=files,
+        headers=headers
     )
     
     if not hasattr(response, 'status_code'):

@@ -198,17 +198,27 @@ class ClientGenerator:
         path_params = re.findall(r"\{(\w+)\}", path)
 
         # Используем только параметры из OpenAPI спецификации
+        param_mapping = {}
         for param_spec in spec.get("parameters", []):
             param = self._create_parameter(param_spec, path, path_params)
             parameters.append(param)
+
+            # Создаем маппинг с оригинальным именем и типом параметра
+            original_name = param_spec["name"]
+            param_type = param_spec["in"]
+            param_mapping[param.name] = {"name": original_name, "type": param_type}
 
         # Body параметры
         request_body = spec.get("requestBody", {})
         whole_body_fields = []
         field_mapping = {}
+        body_required = False
         if request_body:
             body_params = self._create_body_parameters(request_body, zone)
             parameters.extend(body_params)
+
+            # Определяем является ли body обязательным
+            body_required = request_body.get("required", False)
 
             # Определяем какие поля должны передаваться целиком
             whole_body_fields = self._determine_whole_body_fields(request_body, zone)
@@ -266,6 +276,20 @@ class ClientGenerator:
                 mapping_items.append(f"'{param_name}': '{original_name}'")
             mapping_str = "{" + ", ".join(mapping_items) + "}"
             decorator_args.append(f"field_mapping={mapping_str}")
+
+        if param_mapping:
+            # Добавляем param_mapping если есть
+            mapping_items = []
+            for param_name, param_info in param_mapping.items():
+                mapping_items.append(
+                    f"'{param_name}': {{'name': '{param_info['name']}', 'type': '{param_info['type']}'}}"
+                )
+            mapping_str = "{" + ", ".join(mapping_items) + "}"
+            decorator_args.append(f"param_mapping={mapping_str}")
+
+        if body_required:
+            # Добавляем body_required если body обязательный
+            decorator_args.append("body_required=True")
 
         decorator = f"@{method}({', '.join(decorator_args)})"
 
@@ -1215,6 +1239,9 @@ class ClientGenerator:
                     original_name
                 ].get("properties", {})
 
+            # Отслеживаем используемые имена полей для предотвращения дублирования
+            used_field_names = set()
+
             for field_name, field_spec in properties.items():
                 # Если есть оригинальная спецификация поля, используем ее для определения типа
                 original_field_spec = original_properties.get(field_name, field_spec)
@@ -1233,6 +1260,14 @@ class ClientGenerator:
 
                 # Очищаем имя поля для использования в Python
                 clean_field_name = self._clean_parameter_name(field_name)
+
+                # Обрабатываем дублированные имена полей
+                original_clean_name = clean_field_name
+                counter = 1
+                while clean_field_name in used_field_names:
+                    clean_field_name = f"{original_clean_name}_{counter}"
+                    counter += 1
+                used_field_names.add(clean_field_name)
 
                 # Если имя изменилось, используем Field с alias
                 if clean_field_name != field_name:
@@ -2531,7 +2566,7 @@ class ClientGenerator:
                     model_schema = schemas[ref_name]
                     properties = model_schema.get("properties", {})
 
-                    # Воспроизводим логику дедупликации из _create_body_parameters
+                    # Воспроизводим точно ту же логику дедупликации что в _create_body_parameters
                     used_param_names = set()
 
                     for original_name, prop_schema in properties.items():
@@ -2543,7 +2578,7 @@ class ClientGenerator:
                         else:
                             param_name = f"{clean_name}_body"
 
-                        # Дедупликация имен (та же логика что в _create_body_parameters)
+                        # Дедупликация имен (точно та же логика что в _create_body_parameters)
                         original_param_name = param_name
                         counter = 1
                         while param_name in used_param_names:
@@ -2556,19 +2591,51 @@ class ClientGenerator:
                             field_name = param_name[:-5]  # убираем _file
                         else:
                             field_name = param_name[:-5]  # убираем _body
-                        field_mapping[field_name] = original_name
+
+                        # Только если field_name отличается от original_name, добавляем в маппинг
+                        if field_name != original_name:
+                            field_mapping[field_name] = original_name
 
             # Если это object со свойствами напрямую
             elif schema.get("type") == "object":
                 properties = schema.get("properties", {})
 
+                # Воспроизводим точно ту же логику дедупликации что в _create_body_parameters
+                used_param_names = set()
+
                 for original_name, prop_schema in properties.items():
                     # Очищаем имя параметра так же как делает генератор
                     clean_name = self._clean_parameter_name(original_name)
-                    snake_case_name = self._snake_case(clean_name)
 
-                    # Если очищенное имя отличается от оригинального
-                    if snake_case_name != original_name:
-                        field_mapping[snake_case_name] = original_name
+                    if content_type == "multipart/form-data":
+                        param_name = f"{clean_name}_file"
+                    else:
+                        param_name = f"{clean_name}_body"
+
+                    # Дедупликация имен (точно та же логика что в _create_body_parameters)
+                    original_param_name = param_name
+                    counter = 1
+                    while param_name in used_param_names:
+                        param_name = f"{original_param_name}_{counter}"
+                        counter += 1
+                    used_param_names.add(param_name)
+
+                    # Создаем маппинг используя встроенную утилиту
+                    suffix = (
+                        "_file" if content_type == "multipart/form-data" else "_body"
+                    )
+
+                    # Извлекаем field_name используя rfind логику
+                    if suffix in param_name:
+                        suffix_pos = param_name.rfind(suffix)
+                        base_name = param_name[:suffix_pos]
+                        remainder = param_name[suffix_pos + len(suffix) :]
+                        field_name = base_name + remainder if remainder else base_name
+                    else:
+                        field_name = param_name
+
+                    # Только если field_name отличается от original_name, добавляем в маппинг
+                    if field_name != original_name:
+                        field_mapping[field_name] = original_name
 
         return field_mapping
