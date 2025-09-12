@@ -301,6 +301,8 @@ class ClientGenerator:
             response=return_type,
             description=spec.get("description", ""),
             decorators=[decorator],
+            http_method=method,
+            http_path=path,
         )
 
         # Декораторы делают всю работу - пустое тело
@@ -409,9 +411,21 @@ class ClientGenerator:
 
         var_type = self._get_type(param_spec.get("schema", {}), "")
 
+        # Извлекаем дефолтное значение из OpenAPI schema
         default = None
         if not param_spec.get("required", False):
-            default = Variable(value="NOTSET")
+            schema = param_spec.get("schema", {})
+            if "default" in schema:
+                # Форматируем дефолтное значение в зависимости от типа
+                default_value = schema["default"]
+                if isinstance(default_value, str):
+                    default = Variable(value=f'"{default_value}"')
+                elif isinstance(default_value, bool):
+                    default = Variable(value=str(default_value))
+                else:
+                    default = Variable(value=str(default_value))
+            else:
+                default = Variable(value="NOTSET")
 
         return Parameter(name=param_name, var_type=var_type, default=default)
 
@@ -652,7 +666,20 @@ class ClientGenerator:
 
                     # Устанавливаем default в зависимости от required флагов
                     field_is_required = is_required and prop_name in required_fields
-                    default = None if field_is_required else Variable(value="NOTSET")
+                    if field_is_required:
+                        default = None
+                    else:
+                        # Извлекаем дефолтное значение из schema
+                        if "default" in prop_spec:
+                            default_value = prop_spec["default"]
+                            if isinstance(default_value, str):
+                                default = Variable(value=f'"{default_value}"')
+                            elif isinstance(default_value, bool):
+                                default = Variable(value=str(default_value))
+                            else:
+                                default = Variable(value=str(default_value))
+                        else:
+                            default = Variable(value="NOTSET")
 
                     parameters.append(
                         Parameter(name=param_name, var_type=var_type, default=default)
@@ -2048,6 +2075,10 @@ class ClientGenerator:
             full_name = self._find_schema_by_title(title)
             clean_name = self._get_clean_schema_name(full_name)
             return Variable(value=f'"{clean_name}"')
+
+        # Если есть только title без type - это Any
+        if "title" in schema and "type" not in schema:
+            return Variable(value="Any")
 
         # Fallback к обычному типу
         return self._get_type(schema, zone)

@@ -161,6 +161,10 @@ class Function(BaseModel):
     deprecated: bool = False
     tags: list[str] = []
 
+    # HTTP endpoint метаданные
+    http_method: Optional[str] = None
+    http_path: Optional[str] = None
+
     # Продвинутые метаданные
     metadata: Optional[FunctionMetadata] = None
     errors: List[EndpointError] = []
@@ -222,7 +226,7 @@ class Function(BaseModel):
 
     def _generate_docstring(self) -> str:
         """Генерация подробного docstring на основе метаданных"""
-        if not self.metadata and not self.description:
+        if not self.metadata and not self.description and not self.http_method:
             return ""
 
         lines = ['"""']
@@ -232,6 +236,12 @@ class Function(BaseModel):
             lines.append(self.metadata.summary)
         elif self.description:
             lines.append(self.description)
+
+        # HTTP метод и путь
+        if self.http_method and self.http_path:
+            if lines[-1] != '"""':  # Если есть описание выше
+                lines.append("")
+            lines.append(f"HTTP: {self.http_method.upper()} {self.http_path}")
 
         # Подробное описание
         if self.metadata and self.metadata.description:
@@ -256,8 +266,16 @@ class Function(BaseModel):
                             param_desc = meta_param.description or ""
                             break
 
+                # Добавляем информацию о дефолтном значении
+                default_info = ""
+                if param.default and param.default.value != "None":
+                    # Правильно отображаем дефолтное значение из Variable
+                    default_value = str(param.default)
+                    if default_value != "NOTSET":
+                        default_info = f" (default: {default_value})"
+
                 lines.append(
-                    f"    {param_name} ({param_type}): {param_desc or 'Parameter description'}"
+                    f"    {param_name} ({param_type}): {param_desc or 'Parameter description'}{default_info}"
                 )
 
         # Возвращаемое значение
