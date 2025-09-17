@@ -1861,7 +1861,7 @@ class ClientGenerator:
                         )
                         types.append(
                             Variable(
-                                value=f'"{self._get_clean_schema_name(ref_name)}"',
+                                value=f'"{self._get_clean_schema_name(title)}"',
                                 wrap_name="List",
                             )
                         )
