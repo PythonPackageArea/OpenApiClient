@@ -237,6 +237,9 @@ class ClientGenerator:
 
             all_models.append((filename, unique_name))
 
+        # Генерируем inline схемы из responses
+        self._generate_inline_schemas(all_models, models_needing_rebuild)
+
         # Добавляем импорты всех моделей в __init__.py
         # Используем set для удаления дубликатов импортов
         unique_imports = set()
@@ -256,6 +259,59 @@ class ClientGenerator:
             for model_name in models_needing_rebuild:
                 rebuild_code += f"\n{model_name}.model_rebuild()"
             models_init.add_code_block(CodeBlock(code=rebuild_code, order=100))
+
+    def _generate_inline_schemas(self, all_models: list, models_needing_rebuild: list):
+        """Генерирует inline схемы из responses"""
+        # Собираем все inline схемы из responses
+        inline_schemas = {}
+
+        for path, path_spec in self.openapi_dict.get("paths", {}).items():
+            for method, method_spec in path_spec.items():
+                for status_code, response_spec in method_spec.get(
+                    "responses", {}
+                ).items():
+                    if status_code.startswith("2"):  # Только успешные ответы
+                        content = response_spec.get("content", {})
+                        for content_type, content_spec in content.items():
+                            schema = content_spec.get("schema", {})
+                            if schema.get("title") and not "$ref" in schema:
+                                # Это inline схема с title
+                                title = schema["title"]
+                                clean_name = self._get_clean_schema_name(title)
+
+                                # Проверяем что схема еще не была обработана
+                                if clean_name not in [
+                                    model_name for _, model_name in all_models
+                                ]:
+                                    inline_schemas[title] = schema
+
+        # Генерируем модели для inline схем
+        for title, schema_spec in inline_schemas.items():
+            clean_name = self._get_clean_schema_name(title)
+            filename = self._snake_case(clean_name)
+
+            # Исправляем имена файлов и классов начинающиеся с цифр
+            if filename and filename[0].isdigit():
+                filename = f"inline_{filename}"
+            if clean_name and clean_name[0].isdigit():
+                clean_name = f"Inline{clean_name}"
+
+            # Пропускаем схемы с additionalProperties без properties - это Dict, а не модель
+            if (
+                schema_spec.get("type") == "object"
+                and "additionalProperties" in schema_spec
+                and not schema_spec.get("properties")
+            ):
+                continue
+
+            # Генерируем модель
+            needs_rebuild = self._generate_model(
+                title, clean_name, schema_spec, filename
+            )
+            if needs_rebuild:
+                models_needing_rebuild.append(clean_name)
+
+            all_models.append((filename, clean_name))
 
     def _generate_endpoints(self):
         """Генерация endpoints по тегам"""
