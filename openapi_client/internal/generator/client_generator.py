@@ -38,19 +38,101 @@ class ClientGenerator:
         self.schema_file_names = {}  # schema_name -> file_name mapping
 
     def _analyze_schema_names(self) -> Dict[str, str]:
-        """Анализ имен схем для генерации оптимальных имен файлов"""
+        """Анализ имен схем для генерации оптимальных имен файлов с разрешением конфликтов"""
         schemas = self.openapi_dict.get("components", {}).get("schemas", {})
         schema_to_filename = {}
 
+        # Сначала собираем все чистые имена и находим конфликты
+        clean_name_to_schemas = {}
         for schema_name in schemas.keys():
-            # Получаем чистое имя схемы
             clean_name = self._get_clean_schema_name(schema_name)
+            if clean_name not in clean_name_to_schemas:
+                clean_name_to_schemas[clean_name] = []
+            clean_name_to_schemas[clean_name].append(schema_name)
 
-            # Генерируем имя файла из полного имени модели
-            filename = self._snake_case(clean_name)
-            schema_to_filename[schema_name] = filename
+        # Разрешаем конфликты только для дублирующихся имен
+        for clean_name, conflicting_schemas in clean_name_to_schemas.items():
+            if len(conflicting_schemas) == 1:
+                # Нет конфликта - используем оригинальное имя
+                schema_name = conflicting_schemas[0]
+                filename = self._snake_case(clean_name)
+                schema_to_filename[schema_name] = filename
+            else:
+                # Есть конфликт - создаем уникальные имена
+                for schema_name in conflicting_schemas:
+                    unique_name = self._create_unique_schema_name(
+                        schema_name, clean_name, conflicting_schemas
+                    )
+                    filename = self._snake_case(unique_name)
+                    schema_to_filename[schema_name] = filename
 
         return schema_to_filename
+
+    def _create_unique_schema_name(
+        self, schema_name: str, clean_name: str, conflicting_schemas: List[str]
+    ) -> str:
+        """Создает уникальное имя для схемы на основе контекста происхождения"""
+        # Извлекаем контекст из оригинального имени схемы
+        context = self._extract_schema_context(schema_name)
+
+        if context:
+            # Используем контекст для создания уникального имени
+            return f"{context}{clean_name}"
+        else:
+            # Fallback - добавляем суффикс на основе позиции в списке конфликтующих
+            index = conflicting_schemas.index(schema_name)
+            if index == 0:
+                return clean_name  # Первая схема сохраняет оригинальное имя
+            else:
+                return f"{clean_name}{index + 1}"
+
+    def _extract_schema_context(self, schema_name: str) -> str:
+        """Универсальное извлечение контекста из имени схемы"""
+        # Разбиваем имя на части по разделителям
+        parts = [
+            p for p in schema_name.replace("__", "_").split("_") if p and len(p) > 1
+        ]
+
+        if not parts:
+            return ""
+
+        # Простая универсальная логика: берем четвертую с конца часть
+        # Для app__services__exports__schemas__Includes__Counts
+        # parts = ['app', 'services', 'exports', 'schemas', 'Includes', 'Counts']
+        # Берем четвертую с конца: 'exports'
+        if len(parts) >= 4:
+            return parts[-4].capitalize()
+        elif len(parts) >= 3:
+            return parts[-3].capitalize()
+        elif len(parts) >= 2:
+            return parts[-2].capitalize()
+        else:
+            return parts[-1].capitalize()
+
+    def _get_unique_model_name(self, schema_name: str) -> str:
+        """Получает уникальное имя модели для схемы"""
+        # Сначала получаем базовое чистое имя
+        clean_name = self._get_clean_schema_name(schema_name)
+
+        # Проверяем есть ли конфликт с другими схемами
+        schemas = self.openapi_dict.get("components", {}).get("schemas", {})
+        conflicting_schemas = []
+
+        for other_schema_name in schemas.keys():
+            if other_schema_name != schema_name:
+                other_clean_name = self._get_clean_schema_name(other_schema_name)
+                if other_clean_name == clean_name:
+                    conflicting_schemas.append(other_schema_name)
+
+        # Если есть конфликты, создаем уникальное имя
+        if conflicting_schemas:
+            conflicting_schemas.append(schema_name)  # Добавляем текущую схему
+            return self._create_unique_schema_name(
+                schema_name, clean_name, conflicting_schemas
+            )
+        else:
+            # Нет конфликтов - используем оригинальное имя
+            return clean_name
 
     def generate(self) -> Project:
         """Основная генерация"""
@@ -67,11 +149,11 @@ class ClientGenerator:
         """Регистрация всех схем для правильного разрешения имен"""
         schemas = self.openapi_dict.get("components", {}).get("schemas", {})
 
-        # Регистрируем основные схемы
+        # Регистрируем основные схемы с уникальными именами
         for schema_name, schema_spec in schemas.items():
             zone = "common"  # Все модели теперь в общей зоне
-            clean_name = self._get_clean_schema_name(schema_name)
-            self.schema_resolver.register_schema(schema_name, clean_name, zone)
+            unique_name = self._get_unique_model_name(schema_name)
+            self.schema_resolver.register_schema(schema_name, unique_name, zone)
 
         # Регистрируем inline схемы с title из responses
         for path, path_spec in self.openapi_dict.get("paths", {}).items():
@@ -140,19 +222,20 @@ class ClientGenerator:
 
         # Генерируем отдельный файл для каждой схемы
         for schema_name, schema_spec in schemas.items():
-            clean_name = self._get_clean_schema_name(schema_name)
+            # Используем уникальное имя из анализа конфликтов
+            unique_name = self._get_unique_model_name(schema_name)
             filename = self.schema_file_names.get(
-                schema_name, self._snake_case(clean_name)
+                schema_name, self._snake_case(unique_name)
             )
 
             # Генерируем модель в отдельном файле
             needs_rebuild = self._generate_model(
-                schema_name, clean_name, schema_spec, filename
+                schema_name, unique_name, schema_spec, filename
             )
             if needs_rebuild:
-                models_needing_rebuild.append(clean_name)
+                models_needing_rebuild.append(unique_name)
 
-            all_models.append((filename, clean_name))
+            all_models.append((filename, unique_name))
 
         # Добавляем импорты всех моделей в __init__.py
         # Используем set для удаления дубликатов импортов
@@ -1492,9 +1575,9 @@ class ClientGenerator:
                     dep_filename = self.schema_file_names.get(
                         dep, self._snake_case(dep)
                     )
-                    dep_clean_name = self._get_clean_schema_name(dep)
+                    dep_unique_name = self._get_unique_model_name(dep)
                     type_checking_imports.append(
-                        f"    from .{dep_filename} import {dep_clean_name}"
+                        f"    from .{dep_filename} import {dep_unique_name}"
                     )
 
             if type_checking_imports:
@@ -1936,7 +2019,7 @@ class ClientGenerator:
                     found_schema, zone, include_zone_prefix=False
                 )
                 # С from __future__ import annotations кавычки не нужны
-                return Variable(value=f'"{self._get_clean_schema_name(found_schema)}"')
+                return Variable(value=f'"{self._get_unique_model_name(found_schema)}"')
             else:
                 # Inline enum - создаем Literal вместо dependency
                 if schema.get("enum"):
@@ -1970,7 +2053,7 @@ class ClientGenerator:
 
                         # Используем модель с правильным именем
                         types.append(
-                            Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
+                            Variable(value=f'"{self._get_unique_model_name(ref_name)}"')
                         )
                     else:
                         # Fallback для незарегистрированных схем
@@ -1998,7 +2081,7 @@ class ClientGenerator:
                         )
                         types.append(
                             Variable(
-                                value=f'"{self._get_clean_schema_name(ref_name)}"',
+                                value=f'"{self._get_unique_model_name(ref_name)}"',
                                 wrap_name="List",
                             )
                         )
@@ -2073,7 +2156,7 @@ class ClientGenerator:
                 )
 
                 # Используем модель с правильным именем
-                return Variable(value=f'"{self._get_clean_schema_name(ref_name)}"')
+                return Variable(value=f'"{self._get_unique_model_name(ref_name)}"')
             else:
                 # Fallback для незарегистрированных схем
                 return Variable(value="dict")
@@ -2089,7 +2172,7 @@ class ClientGenerator:
                     ref_name, zone, include_zone_prefix=False
                 )
                 return Variable(
-                    value=f'"{self._get_clean_schema_name(ref_name)}"', wrap_name="List"
+                    value=f'"{self._get_unique_model_name(ref_name)}"', wrap_name="List"
                 )
             elif items.get("type") == "object" and "title" in items:
                 # Inline объект с title - используем fallback логику
@@ -2308,7 +2391,7 @@ class ClientGenerator:
                 # Для endpoint параметров используем кросс-ссылки
                 resolved_name = self.schema_resolver.resolve_schema_name(ref_name, "")
                 return Variable(
-                    value=f'"{self._get_clean_schema_name(ref_name)}"', wrap_name="List"
+                    value=f'"{self._get_unique_model_name(ref_name)}"', wrap_name="List"
                 )
             else:
                 item_type = self._get_type_for_endpoint_parameter(items)
