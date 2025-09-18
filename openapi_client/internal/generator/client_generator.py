@@ -421,18 +421,27 @@ class ClientGenerator:
 
         # Проходим по всем методам зоны
         for func in zone_class.functions.values():
-            # Ищем response_model в декораторах
+            # Ищем response_model и response_models в декораторах
             for decorator in func.decorators:
-                if "response_model=" in decorator:
-                    # Извлекаем имя модели из декоратора
+                if "response_model=" in decorator or "response_models=" in decorator:
+                    # Извлекаем имена моделей из декоратора
                     import re
 
+                    # Ищем response_model=ModelName
                     match = re.search(r"response_model=(\w+)", decorator)
                     if match:
                         model_name = match.group(1)
-                        # Добавляем только если модель существует
                         if model_name in existing_models:
                             zone_models.add(model_name)
+
+                    # Ищем response_models=[Model1, Model2, ...]
+                    matches = re.findall(r"response_models=\[([^\]]+)\]", decorator)
+                    for match in matches:
+                        # Разбираем список моделей
+                        models = [m.strip() for m in match.split(",")]
+                        for model_name in models:
+                            if model_name in existing_models:
+                                zone_models.add(model_name)
 
             # Ищем модели в типах параметров (для enum'ов и других типов)
             for param in func.parameters:
