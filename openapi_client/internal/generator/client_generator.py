@@ -363,7 +363,158 @@ class ClientGenerator:
                         if type_name in existing_models:
                             zone_models.add(type_name)
 
-        return zone_models
+        # Рекурсивно собираем все зависимости для найденных моделей
+        all_models = set(zone_models)
+        for model_name in zone_models:
+            dependencies = self._collect_model_dependencies(model_name)
+            all_models.update(dependencies)
+
+        return all_models
+
+    def _collect_model_dependencies(self, model_name: str) -> set:
+        """Рекурсивно собирает все зависимости модели из OpenAPI схемы или файлов моделей"""
+        dependencies = set()
+        existing_models = self._get_all_existing_models()
+
+        # Сначала пытаемся найти в OpenAPI схеме
+        schemas = self.openapi_dict.get("components", {}).get("schemas", {})
+
+        if model_name in schemas:
+            schema = schemas[model_name]
+            self._collect_schema_dependencies(
+                schema, dependencies, existing_models, set(), 0
+            )
+        else:
+            # Если не найдено в OpenAPI схеме, анализируем файл модели
+            self._collect_dependencies_from_model_file(
+                model_name, dependencies, existing_models
+            )
+
+        return dependencies
+
+    def _collect_schema_dependencies(
+        self,
+        schema: dict,
+        dependencies: set,
+        existing_models: set,
+        visited: set,
+        depth: int,
+    ):
+        """Рекурсивно собирает зависимости из схемы с защитой от циклических зависимостей"""
+        # Ограничиваем глубину рекурсии
+        if depth > 10:
+            return
+
+        if not schema or not isinstance(schema, dict):
+            return
+
+        # Обрабатываем $ref
+        if "$ref" in schema:
+            ref_name = schema["$ref"].replace("#/components/schemas/", "")
+            if (
+                ref_name in existing_models
+                and ref_name not in dependencies
+                and ref_name not in visited
+            ):
+                dependencies.add(ref_name)
+                # Рекурсивно собираем зависимости для этой модели
+                schemas = self.openapi_dict.get("components", {}).get("schemas", {})
+                if ref_name in schemas:
+                    new_visited = visited.copy()
+                    new_visited.add(ref_name)
+                    self._collect_schema_dependencies(
+                        schemas[ref_name],
+                        dependencies,
+                        existing_models,
+                        new_visited,
+                        depth + 1,
+                    )
+            return
+
+        # Обрабатываем anyOf/oneOf
+        for union_type in ["anyOf", "oneOf"]:
+            if union_type in schema:
+                for variant in schema[union_type]:
+                    self._collect_schema_dependencies(
+                        variant, dependencies, existing_models, visited, depth + 1
+                    )
+
+        # Обрабатываем массивы
+        if schema.get("type") == "array" and "items" in schema:
+            self._collect_schema_dependencies(
+                schema["items"], dependencies, existing_models, visited, depth + 1
+            )
+
+        # Обрабатываем объекты с properties
+        if schema.get("type") == "object" and "properties" in schema:
+            for field_name, field_schema in schema["properties"].items():
+                self._collect_schema_dependencies(
+                    field_schema, dependencies, existing_models, visited, depth + 1
+                )
+
+        # Обрабатываем additionalProperties
+        if "additionalProperties" in schema and isinstance(
+            schema["additionalProperties"], dict
+        ):
+            self._collect_schema_dependencies(
+                schema["additionalProperties"],
+                dependencies,
+                existing_models,
+                visited,
+                depth + 1,
+            )
+
+    def _collect_dependencies_from_model_file(
+        self, model_name: str, dependencies: set, existing_models: set
+    ):
+        """Собирает зависимости из файла модели, анализируя TYPE_CHECKING импорты"""
+        # Ищем файл модели
+        model_file = None
+        for file in self.project.files:
+            if file.file_name.startswith("models/") and file.file_name.endswith(".py"):
+                # Проверяем, есть ли в файле класс с нужным именем
+                if model_name in file.classes:
+                    model_file = file
+                    break
+
+        if not model_file:
+            return
+
+        # Анализируем TYPE_CHECKING импорты в файле
+        in_type_checking = False
+        for import_line in model_file.imports:
+            if "if TYPE_CHECKING:" in import_line:
+                in_type_checking = True
+                continue
+            elif (
+                in_type_checking
+                and import_line.strip()
+                and not import_line.startswith("    ")
+            ):
+                in_type_checking = False
+                continue
+
+            if in_type_checking and "from ." in import_line:
+                # Извлекаем имена импортируемых моделей
+                import re
+
+                matches = re.findall(r"from \.(\w+) import (\w+)", import_line)
+                for module_name, class_name in matches:
+                    if class_name in existing_models:
+                        dependencies.add(class_name)
+
+                # Также ищем импорты без from
+                matches = re.findall(r"from \.(\w+) import", import_line)
+                for module_name in matches:
+                    # Преобразуем имя модуля в имя класса (snake_case -> PascalCase)
+                    class_name = self._snake_case_to_pascal_case(module_name)
+                    if class_name in existing_models:
+                        dependencies.add(class_name)
+
+    def _snake_case_to_pascal_case(self, snake_str: str) -> str:
+        """Преобразует snake_case в PascalCase"""
+        components = snake_str.split("_")
+        return "".join(word.capitalize() for word in components)
 
     def _get_all_existing_models(self) -> set:
         """Получает список всех существующих моделей в проекте"""
