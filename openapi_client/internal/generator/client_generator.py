@@ -366,7 +366,9 @@ class ClientGenerator:
             field_mapping = self._create_field_mapping(request_body, zone)
 
         # Тип возврата
-        return_type = self._get_return_type(spec.get("responses", {}), zone)
+        return_type = self._get_return_type(
+            spec.get("responses", {}), zone, path, method
+        )
 
         # Получаем чистое имя модели для декоратора
         clean_model_type = self._get_clean_model_type(spec.get("responses", {}), zone)
@@ -385,6 +387,15 @@ class ClientGenerator:
                 return_type = f"List[{clean_model_type}]"
             else:
                 return_type = clean_model_type
+
+        # Если есть response_models_list, но return_type не Union,
+        # значит _get_return_type вернул только один тип из Union'а
+        # В этом случае нужно использовать полный Union тип
+        if response_models_list and len(response_models_list) >= 1:
+            # Получаем все типы из _get_return_type включая примитивные
+            full_return_type = self._get_return_type(spec.get("responses", {}), zone)
+            if full_return_type.startswith("Union[") or "Literal[" in full_return_type:
+                return_type = full_return_type
 
         # Создаем декоратор
         decorator_args = [f"'{path}'"]
@@ -1088,7 +1099,9 @@ class ClientGenerator:
 
         return Variable(value=base_type)
 
-    def _get_return_type(self, responses: Dict, zone: str) -> str:
+    def _get_return_type(
+        self, responses: Dict, zone: str, path: str = "", method: str = ""
+    ) -> str:
         """Получение типа возврата с правильными моделями"""
         success_responses = []
 
@@ -1122,6 +1135,8 @@ class ClientGenerator:
                                     title = variant["title"]
                                     # Ищем схему с таким title в правильной зоне
                                     found = False
+                                    best_match = None
+
                                     for schema_name, schema_spec in (
                                         self.openapi_dict.get("components", {})
                                         .get("schemas", {})
@@ -1158,17 +1173,27 @@ class ClientGenerator:
                                                     )
                                                     found = True
                                                     break
+                                                elif not best_match:
+                                                    # Сохраняем первое совпадение как fallback
+                                                    best_match = schema_clean_name
                                             else:
                                                 type_variants.append(schema_clean_name)
-                                            found = True
-                                            break
+                                                found = True
+                                                break
+
                                     if not found:
-                                        # Ищем схему по title и используем её полное имя
-                                        full_name = self._find_schema_by_title(title)
-                                        clean_name = self._get_clean_schema_name(
-                                            full_name
-                                        )
-                                        type_variants.append(clean_name)
+                                        if best_match:
+                                            # Используем лучшее совпадение если точное не найдено
+                                            type_variants.append(best_match)
+                                        else:
+                                            # Ищем схему по title и используем её полное имя
+                                            full_name = self._find_schema_by_title(
+                                                title
+                                            )
+                                            clean_name = self._get_clean_schema_name(
+                                                full_name
+                                            )
+                                            type_variants.append(clean_name)
                                 else:
                                     var_type = self._get_type(variant, zone)
                                     type_variants.append(str(var_type))
