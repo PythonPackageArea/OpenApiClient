@@ -93,6 +93,7 @@ class AiohttpClient:
         self._connection_pool = ConnectionPool()
         self._rate_limiter = None
         self._session_dirty = False
+        self._session_lock = asyncio.Lock()
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -154,10 +155,11 @@ class AiohttpClient:
 
     async def refresh_session(self):
         \"\"\"Принудительное обновление сессии\"\"\"
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
-        self._session_dirty = False
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                await self._session.close()
+            self._session = None
+            self._session_dirty = False
 
     @asynccontextmanager
     async def _session_context(self):
@@ -169,17 +171,30 @@ class AiohttpClient:
             pass  # Сессия остается открытой для повторного использования
 
     async def _ensure_session(self) -> ClientSession:
-        # Пересоздаем сессию если она грязная или не существует
-        if self._session is None or self._session.closed or self._session_dirty:
+        # Быстрая проверка без блокировки
+        if (
+            self._session is not None
+            and not self._session.closed
+            and not self._session_dirty
+        ):
+            return self._session
+
+        # Медленная проверка с блокировкой
+        async with self._session_lock:
+            # Двойная проверка внутри блокировки
+            if (
+                self._session is not None
+                and not self._session.closed
+                and not self._session_dirty
+            ):
+                return self._session
+
             # Закрываем старую сессию
             if self._session and not self._session.closed:
                 await self._session.close()
                 
             timeout = ClientTimeout(
-                total=self._timeout,
-                connect=10,
-                sock_read=10,
-                sock_connect=10
+                total=self._timeout, connect=10, sock_read=10, sock_connect=10
             )
 
             # Объединяем базовые и временные headers/cookies
@@ -198,19 +213,19 @@ class AiohttpClient:
         return self._session
 
     async def _send_request(
-            self,
-            method: str,
-            path: str,
-            content_type: str = None,
-            params: dict = None,
-            files: dict = None,
-            data: Union[dict, list, str] = None,
-            headers: Dict[str, str] = None
+        self,
+        method: str,
+        path: str,
+        content_type: str = None,
+        params: dict = None,
+        files: dict = None,
+        data: Union[dict, list, str] = None,
+        headers: Dict[str, str] = None,
     ) -> Any:
 
         if not self._api_url:
             raise SendRequestError(
-                'API URL is empty',
+                "API URL is empty",
                 path=path,
                 status_code=400,
             )
@@ -225,14 +240,14 @@ class AiohttpClient:
 
                     # Подготовка данных для отправки
                     request_kwargs = {
-                        'method': method,
-                        'url': full_url,
-                        'params': params,
+                        "method": method,
+                        "url": full_url,
+                        "params": params,
                     }
 
                     # Добавление кастомных headers
                     if headers:
-                        request_kwargs['headers'] = headers
+                        request_kwargs["headers"] = headers
 
                     # Обработка файлов
                     if files:
@@ -244,14 +259,12 @@ class AiohttpClient:
                                     form_data.add_field(
                                         field_name,
                                         single_file,
-                                        filename=f'{field_name}_{i}.bin'
+                                        filename=f"{field_name}_{i}.bin",
                                     )
                             else:
                                 # Один файл
                                 form_data.add_field(
-                                    field_name,
-                                    file_data,
-                                    filename=f'{field_name}.bin'
+                                    field_name, file_data, filename=f"{field_name}.bin"
                                 )
                         if data:
                             for key, value in data.items():
@@ -261,20 +274,20 @@ class AiohttpClient:
                                         form_data.add_field(key, str(item))
                                 else:
                                     form_data.add_field(key, str(value))
-                        request_kwargs['data'] = form_data
+                        request_kwargs["data"] = form_data
                     else:
                         # Обработка JSON или form data
                         if isinstance(data, (dict, list)):
                             # По умолчанию отправляем JSON для словарей и списков
                             if content_type == "application/x-www-form-urlencoded":
-                                request_kwargs['data'] = data
+                                request_kwargs["data"] = data
                             else:
-                                request_kwargs['json'] = data
+                                request_kwargs["json"] = data
                         elif isinstance(data, str):
-                            request_kwargs['data'] = data
+                            request_kwargs["data"] = data
                         elif isinstance(data, (int, float, bool)) or data is None:
                             # Примитивные типы и None отправляем как JSON
-                            request_kwargs['json'] = data
+                            request_kwargs["json"] = data
 
                     async with session.request(**request_kwargs) as response:
                         logger.debug(f"Response status: {response.status}")
@@ -317,36 +330,47 @@ class AiohttpClient:
                     logger.warning(f"Request failed (retries left: {_retries}): {exc}")
 
                     if isinstance(exc, ValueError):
-                        raise SendRequestError(
-                            str(exc), path=path, status_code=400
-                        )
+                        raise SendRequestError(str(exc), path=path, status_code=400)
 
                     if not _retries:
                         if isinstance(exc, (ClientError, asyncio.TimeoutError)):
-                            raise SendRequestError(
-                                str(exc), path=path, status_code=503
-                            )
+                            raise SendRequestError(str(exc), path=path, status_code=503)
 
                     await asyncio.sleep(0.5)  # Небольшая пауза перед повтором
 
                 except Exception as exc:
                     logger.error(f"Unexpected error: {exc}")
-                    raise SendRequestError(
-                        str(exc), path=path, status_code=500
-                    )
+
+                    # Специальная обработка для закрытой сессии
+                    if "Session is closed" in str(exc) or "RuntimeError" in str(
+                        type(exc).__name__
+                    ):
+                        _retries -= 1
+                        if _retries > 0:
+                            logger.warning(
+                                f"Session closed, recreating (retries left: {_retries})"
+                            )
+                            # Принудительно обновляем сессию
+                            await self.refresh_session()
+                            await asyncio.sleep(
+                                1.0
+                            )  # Больше времени для восстановления
+                            continue
+
+                    raise SendRequestError(str(exc), path=path, status_code=500)
 
     def initialize(
-            self,
-            api_url: str,
-            headers: Dict[str, str] = None,
-            cookies: Dict[str, str] = None,
-            timeout: int = 30,
-            retries: int = 3,
-            max_connections: int = 100,
-            max_connections_per_host: int = 10
+        self,
+        api_url: str,
+        headers: Dict[str, str] = None,
+        cookies: Dict[str, str] = None,
+        timeout: int = 30,
+        retries: int = 3,
+        max_connections: int = 100,
+        max_connections_per_host: int = 10,
     ) -> "AiohttpClient":
         \"\"\"Инициализация клиента с настройками\"\"\"
-        self._api_url = str(api_url).rstrip('/')
+        self._api_url = str(api_url).rstrip("/")
         
         # Используем property для автоматического обновления сессии
         if headers:
@@ -358,14 +382,17 @@ class AiohttpClient:
         self._retries = int(retries) if retries else 3
 
         # Обновляем настройки пула соединений
-        self._connection_pool = ConnectionPool(max_connections, max_connections_per_host)
+        self._connection_pool = ConnectionPool(
+            max_connections, max_connections_per_host
+        )
 
         return self
 
     async def close(self):
         \"\"\"Закрытие клиента и освобождение ресурсов\"\"\"
-        if self._session and not self._session.closed:
-            await self._session.close()
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                await self._session.close()
 
         await self._connection_pool.close()
 
@@ -384,12 +411,12 @@ class AiohttpClient:
 
     def set_auth_token(self, token: str):
         \"\"\"Установка Bearer токена авторизации\"\"\"
-        return self.update_headers(Authorization=f\"Bearer {token}\")
+        return self.update_headers(Authorization=f"Bearer {token}")
 
     def remove_auth(self):
         \"\"\"Удаление авторизации\"\"\"
-        if \"Authorization\" in self._base_headers:
-            del self._base_headers[\"Authorization\"]
+        if "Authorization" in self._base_headers:
+            del self._base_headers["Authorization"]
             self._session_dirty = True
         return self
 
