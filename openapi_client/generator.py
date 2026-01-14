@@ -16,8 +16,9 @@ class ApiClientGenerator:
         openapi_spec: Dict[str, Any],
         source_url: str = None,
         original_spec: Dict[str, Any] = None,
+        package_name: str = None,
     ):
-        self.parser = OpenApiParser(openapi_spec, source_url, original_spec)
+        self.parser = OpenApiParser(openapi_spec, source_url, original_spec, package_name)
 
     def generate(self) -> Project:
         """Генерация проекта клиента"""

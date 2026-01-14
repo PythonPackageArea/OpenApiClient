@@ -201,10 +201,13 @@ def _generate_client_core(config: OpenApiConfig) -> Project:
     original_spec = openapi_spec.copy()
     openapi_spec = dict(jsonref.loads(json.dumps(openapi_spec)))
 
-    # Генерация
+    # Генерация - используем dirname как имя пакета
     print("⚙️ Генерация кода...")
     generator = ApiClientGenerator(
-        openapi_spec, source_url=config.url, original_spec=original_spec
+        openapi_spec,
+        source_url=config.url,
+        original_spec=original_spec,
+        package_name=config.dirname,
     )
     return generator.generate()
 

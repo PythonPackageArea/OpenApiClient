@@ -12,14 +12,16 @@ class OpenApiParser:
         openapi_dict: Dict[str, Any],
         source_url: str = None,
         original_spec: Dict[str, Any] = None,
+        package_name: str = None,
     ):
         self.openapi_dict = openapi_dict
         self.source_url = source_url
         self.original_spec = original_spec
+        self.package_name = package_name
 
     def parse(self) -> Project:
         """Парсинг OpenAPI в Project структуру"""
         generator = ClientGenerator(
-            self.openapi_dict, self.source_url, self.original_spec
+            self.openapi_dict, self.source_url, self.original_spec, self.package_name
         )
         return generator.generate()
