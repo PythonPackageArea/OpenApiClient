@@ -16,8 +16,11 @@ dependencies = [
     "simple-singleton>=1.0.0",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
+[tool.setuptools]
+packages = ["{package_name}", "{package_name}.models", "{package_name}.endpoints"]
+
+[tool.setuptools.package-dir]
+{package_name} = "."
 """
 
     models = """from typing import Any
