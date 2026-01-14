@@ -25,17 +25,23 @@ class ClientGenerator:
         openapi_dict: Dict[str, Any],
         source_url: str = None,
         original_spec: Dict[str, Any] = None,
+        package_name: str = None,
     ):
         self.openapi_dict = openapi_dict
-        self.original_spec = (
-            original_spec or openapi_dict
-        )  # Используем оригинальную спецификацию если передана
+        self.original_spec = original_spec or openapi_dict
         self.source_url = source_url
+        self.package_name = package_name or self._extract_package_name()
         self.project = Project(name="api")
         self.schema_resolver = SchemaNameResolver()
         self.zones = {}  # zone_name -> {endpoints_file, endpoints_class}
         self.used_schemas = set()  # Только используемые схемы
         self.schema_file_names = {}  # schema_name -> file_name mapping
+
+    def _extract_package_name(self) -> str:
+        """Извлекает имя пакета из OpenAPI info.title"""
+        info = self.openapi_dict.get("info", {})
+        title = info.get("title", "api_client")
+        return self._snake_case(title).replace(" ", "_").replace("-", "_")
 
     def _analyze_schema_names(self) -> Dict[str, str]:
         """Анализ имен схем для генерации оптимальных имен файлов с разрешением конфликтов"""
@@ -176,6 +182,17 @@ class ClientGenerator:
 
     def _create_base_files(self):
         """Создание базовых файлов проекта"""
+        # pyproject.toml для pip install -e .
+        info = self.openapi_dict.get("info", {})
+        pyproject_content = templates.pyproject.format(
+            package_name=self.package_name,
+            version=info.get("version", "0.1.0"),
+            description=info.get("description", f"API client for {self.package_name}"),
+        )
+        self.project.add_file("pyproject.toml").add_code_block(
+            CodeBlock(code=pyproject_content)
+        )
+
         # Основные файлы
         self.project.add_file("common.py").add_code_block(
             CodeBlock(code=templates.aiohttp_common)
@@ -191,6 +208,11 @@ class ClientGenerator:
         )
         self.project.add_file("decorators.py").add_code_block(
             CodeBlock(code=templates.decorators)
+        )
+
+        # endpoints/__init__.py
+        self.project.add_file("endpoints/__init__.py").add_code_block(
+            CodeBlock(code="# Auto-generated endpoints")
         )
 
         # Конфиг файл в папке клиента

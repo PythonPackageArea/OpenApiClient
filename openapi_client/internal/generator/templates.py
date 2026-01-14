@@ -1,6 +1,25 @@
 class Templates:
     """Шаблоны для генерации файлов"""
 
+    pyproject = """[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "{package_name}"
+version = "{version}"
+description = "{description}"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.8.0",
+    "pydantic>=2.0.0",
+    "simple-singleton>=1.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+"""
+
     models = """from typing import Any
 
 class _NotSetType:
