@@ -1913,19 +1913,18 @@ class ClientGenerator:
 
     @staticmethod
     def _snake_case(name: str) -> str:
-        # Сначала заменяем дефисы на подчеркивания
         name = name.replace("-", "_")
-
-        # Обработка аббревиатур: HTTPValidationError -> http_validation_error
-        # Шаг 1: Добавляем подчеркивание перед заглавной буквой, которая следует за строчной
-        s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
-        # Шаг 2: Добавляем подчеркивание между строчной буквой и заглавной
-        s2 = re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1)
-        # Шаг 3: Обрабатываем последовательности заглавных букв (HTTP -> HTTP, HTTPError -> HTTP_Error)
-        s3 = re.sub("([A-Z]+)([A-Z][a-z])", r"\1_\2", s2)
-        # Шаг 4: Убираем дублирующиеся подчеркивания
-        s4 = re.sub("_+", "_", s3)
-        return s4.lower()
+        # Шаг 1: строчная перед заглавной (camelCase -> camel_Case)
+        s1 = re.sub(r"([a-z])([A-Z])", r"\1_\2", name)
+        # Шаг 2a: 2+ заглавных перед словом (HTTPError -> HTTP_Error)
+        s2 = re.sub(r"([A-Z]{2,})([A-Z][a-z])", r"\1_\2", s1)
+        # Шаг 2b: аббревиатура с цифрой перед словом (B2BClient -> B2B_Client)
+        s3 = re.sub(r"([A-Z]+\d+[A-Z]*)([A-Z][a-z])", r"\1_\2", s2)
+        # Шаг 2c: цифра перед словом (OAuth2Token -> OAuth2_Token)
+        s4 = re.sub(r"(\d)([A-Z][a-z])", r"\1_\2", s3)
+        # Шаг 3: убираем двойные подчеркивания
+        s5 = re.sub(r"_+", "_", s4)
+        return s5.lower().strip("_")
 
     @staticmethod
     def _pascal_case(name: str) -> str:
