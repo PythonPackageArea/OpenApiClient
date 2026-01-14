@@ -246,7 +246,10 @@ def _generate_client(config: OpenApiConfig, work_dir: str):
 def _generate_client_in_existing(config: OpenApiConfig, existing_package_dir: str):
     """Генерация клиента в существующую директорию пакета"""
     try:
-        project = _generate_client_core(config)
+        # Используем basename директории как имя пакета
+        package_name = os.path.basename(existing_package_dir.rstrip("/"))
+        config_with_dirname = OpenApiConfig(url=config.url, dirname=package_name)
+        project = _generate_client_core(config_with_dirname)
         _save_project_files(project, existing_package_dir)
 
     except Exception as e:
