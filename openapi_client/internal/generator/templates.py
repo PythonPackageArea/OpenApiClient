@@ -521,31 +521,31 @@ def http_method(
     return decorator
 
 
-def get(
+def _get(
     path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     return http_method("get", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
-def post(
+def _post(
     path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     return http_method("post", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
-def put(
+def _put(
     path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     return http_method("put", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
-def delete(
+def _delete(
     path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     return http_method("delete", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)
 
 
-def patch(
+def _patch(
     path: str, response_model=None, response_models=None, whole_body_fields=None, field_mapping=None, param_mapping=None, body_required=False
 ) -> Callable[[DecoratedCallable], DecoratedCallable]:
     return http_method("patch", path, response_model, response_models, whole_body_fields, field_mapping, param_mapping, body_required)

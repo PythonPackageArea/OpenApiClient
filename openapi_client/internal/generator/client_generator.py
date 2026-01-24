@@ -463,7 +463,7 @@ class ClientGenerator:
             # Добавляем body_required если body обязательный
             decorator_args.append("body_required=True")
 
-        decorator = f"@{method}({', '.join(decorator_args)})"
+        decorator = f"@_{method}({', '.join(decorator_args)})"
 
         # Создаем функцию с декоратором
         func = zone_class.add_function(
@@ -1399,7 +1399,7 @@ class ClientGenerator:
             endpoints_file = self.project.add_file(f"endpoints/{zone.lower()}.py")
             endpoints_file.imports.extend(
                 [
-                    "from ..decorators import get, post, put, delete, patch",
+                    "from ..decorators import _get, _post, _put, _delete, _patch",
                     "from ..common import AiohttpClient",
                     "from typing import Optional, List, Any, Union, Literal, Dict",
                     "from datetime import datetime, date",
